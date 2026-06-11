@@ -369,6 +369,22 @@ void agent_process_stun_response(Agent* agent, StunMessage* stun_msg) {
   }
 }
 
+int agent_recv_datagram(Agent* agent, uint8_t* buf, int len) {
+  Address addr;
+  return agent_socket_recv(agent, &addr, buf, len);
+}
+
+void agent_drain_pending(Agent* agent) {
+  uint8_t buf[1400];
+  Address addr;
+
+  for (int i = 0; i < 32; i++) {
+    if (agent_socket_recv(agent, &addr, buf, sizeof(buf)) <= 0) {
+      break;
+    }
+  }
+}
+
 int agent_recv(Agent* agent, uint8_t* buf, int len) {
   int ret = -1;
   StunMessage stun_msg;
@@ -474,6 +490,44 @@ int agent_connectivity_check(Agent* agent) {
 
   if (agent->nominated_pair->state == ICE_CANDIDATE_STATE_SUCCEEDED) {
     agent->selected_pair = agent->nominated_pair;
+    return 0;
+  }
+
+  return -1;
+}
+
+int agent_skip_connectivity_check(Agent* agent) {
+  int i;
+  char addr_string[ADDRSTRLEN];
+  uint8_t buf[1400];
+  StunMessage msg;
+
+  for (i = 0; i < agent->candidate_pairs_num; i++) {
+    if (agent->candidate_pairs[i].state == ICE_CANDIDATE_STATE_FAILED) {
+      continue;
+    }
+
+    agent->nominated_pair = &agent->candidate_pairs[i];
+    agent->candidate_pairs[i].state = ICE_CANDIDATE_STATE_INPROGRESS;
+
+    memset(&msg, 0, sizeof(msg));
+    addr_to_string(&agent->nominated_pair->remote->addr, addr_string, sizeof(addr_string));
+    LOGD("skip STUN wait: send binding request to remote ip: %s, port: %d",
+         addr_string, agent->nominated_pair->remote->addr.port);
+    agent_create_binding_request(agent, &msg);
+    agent_socket_send(agent, &agent->nominated_pair->remote->addr, msg.buf, msg.size);
+
+    /* Drain STUN responses so they do not block the DTLS handshake. */
+    for (int drain = 0; drain < 16; drain++) {
+      if (agent_recv(agent, buf, sizeof(buf)) <= 0) {
+        break;
+      }
+    }
+    agent_drain_pending(agent);
+
+    agent->candidate_pairs[i].state = ICE_CANDIDATE_STATE_SUCCEEDED;
+    agent->selected_pair = &agent->candidate_pairs[i];
+    agent->binding_request_time = ports_get_epoch_time();
     return 0;
   }
 

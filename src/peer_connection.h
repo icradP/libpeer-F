@@ -8,6 +8,8 @@
 #include <stdint.h>
 #include <stdlib.h>
 
+#include "sdp.h"
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -75,6 +77,17 @@ typedef struct PeerConfiguration {
   MediaCodec audio_codec;
   MediaCodec video_codec;
   DataChannelType datachannel;
+
+  /** SDP_PROFILE_P2P (default), SDP_PROFILE_WHIP (push), SDP_PROFILE_WHEP (pull). */
+  SdpProfile sdp_profile;
+
+  /**
+   * ICE-lite / no-STUN-response mode: still send one STUN Binding Request
+   * (with USE-CANDIDATE) for path nomination, but do not wait for a STUN
+   * response before CONNECTED, and do not disconnect on keepalive timeout.
+   * Use with ZLMediaKit WHIP/WebRTC push when the server is ICE-lite.
+   */
+  int skip_stun_check_keepalive;
 
   void (*onaudiotrack)(uint8_t* data, size_t size, void* userdata);
   void (*onvideotrack)(uint8_t* data, size_t size, void* userdata);

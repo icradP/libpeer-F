@@ -34,27 +34,10 @@ typedef enum RtpSsrc {
 
 } RtpSsrc;
 
-typedef struct RtpHeader {
-#if __BYTE_ORDER == __BIG_ENDIAN
-  uint16_t version : 2;
-  uint16_t padding : 1;
-  uint16_t extension : 1;
-  uint16_t csrccount : 4;
-  uint16_t markerbit : 1;
-  uint16_t type : 7;
-#elif __BYTE_ORDER == __LITTLE_ENDIAN
-  uint16_t csrccount : 4;
-  uint16_t extension : 1;
-  uint16_t padding : 1;
-  uint16_t version : 2;
-  uint16_t type : 7;
-  uint16_t markerbit : 1;
-#endif
-  uint16_t seq_number;
-  uint32_t timestamp;
-  uint32_t ssrc;
-  uint32_t csrc[0];
+#define RTP_HEADER_SIZE 12
 
+typedef struct RtpHeader {
+  uint8_t data[RTP_HEADER_SIZE];
 } RtpHeader;
 
 typedef struct RtpPacket {
@@ -93,7 +76,17 @@ struct RtpEncoder {
   uint8_t buf[CONFIG_MTU + 128];
 };
 
+void rtp_header_write(uint8_t* packet, uint8_t pt, int marker, uint16_t seq, uint32_t timestamp, uint32_t ssrc);
+
+uint8_t rtp_header_payload_type(const uint8_t* packet);
+
 int rtp_packet_validate(uint8_t* packet, size_t size);
+
+int rtp_packet_header_size(const uint8_t* packet, size_t size);
+
+void rtp_encoder_set_payload(RtpEncoder* rtp_encoder, uint8_t payload_type, uint32_t clock_rate);
+
+void rtp_decoder_set_payload(RtpDecoder* rtp_decoder, uint8_t payload_type);
 
 void rtp_encoder_init(RtpEncoder* rtp_encoder, MediaCodec codec, RtpOnPacket on_packet, void* user_data);
 

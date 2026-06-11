@@ -1,16 +1,63 @@
 #include <stdio.h>
 #include <string.h>
+#include <sys/time.h>
 
 #include "address.h"
 #include "rtcp.h"
 #include "rtp.h"
 
+#define NTP_UNIX_EPOCH_OFFSET 2208988800ULL
+
+static void rtcp_write_u32_be(uint8_t* packet, int offset, uint32_t value) {
+  packet[offset] = (uint8_t)(value >> 24);
+  packet[offset + 1] = (uint8_t)(value >> 16);
+  packet[offset + 2] = (uint8_t)(value >> 8);
+  packet[offset + 3] = (uint8_t)(value);
+}
+
+static void rtcp_get_ntp_timestamp(uint32_t* ntp_sec, uint32_t* ntp_frac) {
+  struct timeval tv;
+
+  gettimeofday(&tv, NULL);
+  *ntp_sec = (uint32_t)((uint64_t)tv.tv_sec + NTP_UNIX_EPOCH_OFFSET);
+  *ntp_frac = (uint32_t)(((uint64_t)tv.tv_usec << 32) / 1000000ULL);
+}
+
 int rtcp_probe(uint8_t* packet, size_t size) {
   if (size < 8)
+    return 0;
+
+  if ((packet[0] & 0xC0) != 0x80)
+    return 0;
+
+  uint8_t pt = packet[1];
+  // RFC 5761 mux range, or standard RTCP packet types.
+  return (pt >= 64 && pt <= 95) || (pt >= 192 && pt <= 223);
+}
+
+int rtcp_build_sr(uint8_t* packet, int len, uint32_t ssrc, uint32_t rtp_timestamp, uint32_t packet_count, uint32_t octet_count) {
+  if (packet == NULL || len < 28)
     return -1;
 
-  RtpHeader* header = (RtpHeader*)packet;
-  return ((header->type >= 64) && (header->type < 96));
+  memset(packet, 0, len);
+  packet[0] = 0x80;
+  packet[1] = RTCP_SR;
+  packet[2] = 0;
+  packet[3] = 6;
+
+  uint32_t ntp_sec;
+  uint32_t ntp_frac;
+
+  rtcp_get_ntp_timestamp(&ntp_sec, &ntp_frac);
+
+  rtcp_write_u32_be(packet, 4, ssrc);
+  rtcp_write_u32_be(packet, 8, ntp_sec);
+  rtcp_write_u32_be(packet, 12, ntp_frac);
+  rtcp_write_u32_be(packet, 16, rtp_timestamp);
+  rtcp_write_u32_be(packet, 20, packet_count);
+  rtcp_write_u32_be(packet, 24, octet_count);
+
+  return 28;
 }
 
 int rtcp_get_pli(uint8_t* packet, int len, uint32_t ssrc) {
@@ -18,12 +65,14 @@ int rtcp_get_pli(uint8_t* packet, int len, uint32_t ssrc) {
     return -1;
 
   memset(packet, 0, len);
-  RtcpHeader* rtcp_header = (RtcpHeader*)packet;
-  rtcp_header->version = 2;
-  rtcp_header->type = RTCP_PSFB;
-  rtcp_header->rc = 1;
-  rtcp_header->length = htons((len / 4) - 1);
-  memcpy(packet + 8, &ssrc, 4);
+  packet[0] = 0x80;
+  packet[1] = RTCP_PSFB;
+  packet[2] = 0;
+  packet[3] = (len / 4) - 1;
+  packet[4] = (uint8_t)(ssrc >> 24);
+  packet[5] = (uint8_t)(ssrc >> 16);
+  packet[6] = (uint8_t)(ssrc >> 8);
+  packet[7] = (uint8_t)(ssrc);
 
   return 12;
 }
@@ -33,18 +82,15 @@ int rtcp_get_fir(uint8_t* packet, int len, int* seqnr) {
     return -1;
 
   memset(packet, 0, len);
-  RtcpHeader* rtcp = (RtcpHeader*)packet;
   *seqnr = *seqnr + 1;
   if (*seqnr < 0 || *seqnr >= 256)
     *seqnr = 0;
 
-  rtcp->version = 2;
-  rtcp->type = RTCP_PSFB;
-  rtcp->rc = 4;
-  rtcp->length = htons((len / 4) - 1);
-  RtcpFb* rtcp_fb = (RtcpFb*)rtcp;
-  RtcpFir* fir = (RtcpFir*)rtcp_fb->fci;
-  fir->seqnr = htonl(*seqnr << 24);
+  packet[0] = 0x81;
+  packet[1] = RTCP_PSFB;
+  packet[2] = 0;
+  packet[3] = (len / 4) - 1;
+  packet[16] = (uint8_t)(*seqnr);
 
   return 20;
 }

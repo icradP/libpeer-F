@@ -3,6 +3,20 @@
 
 #include "sdp.h"
 
+static int sdp_profile_is_zlm_streaming(SdpProfile profile) {
+  return profile == SDP_PROFILE_WHIP || profile == SDP_PROFILE_WHEP;
+}
+
+static void sdp_append_media_direction(char* sdp, SdpProfile profile) {
+  if (profile == SDP_PROFILE_WHIP) {
+    sdp_append(sdp, "a=sendonly");
+  } else if (profile == SDP_PROFILE_WHEP) {
+    sdp_append(sdp, "a=recvonly");
+  } else {
+    sdp_append(sdp, "a=sendrecv");
+  }
+}
+
 int sdp_append(char* sdp, const char* format, ...) {
   va_list argptr;
 
@@ -26,7 +40,23 @@ void sdp_reset(char* sdp) {
   memset(sdp, 0, CONFIG_SDP_BUFFER_SIZE);
 }
 
-void sdp_append_h264(char* sdp) {
+void sdp_append_h264(char* sdp, SdpProfile profile) {
+  if (sdp_profile_is_zlm_streaming(profile)) {
+    sdp_append(sdp, "m=video 9 UDP/TLS/RTP/SAVPF 96");
+    sdp_append(sdp, "c=IN IP4 0.0.0.0");
+    sdp_append(sdp, "a=rtcp:9 IN IP4 0.0.0.0");
+    sdp_append(sdp, "a=rtcp-fb:96 nack");
+    sdp_append(sdp, "a=rtcp-fb:96 nack pli");
+    sdp_append(sdp, "a=fmtp:96 profile-level-id=42e01f;level-asymmetry-allowed=1");
+    sdp_append(sdp, "a=rtpmap:96 H264/90000");
+    sdp_append(sdp, "a=ssrc:1 cname:webrtc-h264");
+    sdp_append_media_direction(sdp, profile);
+    sdp_append(sdp, "a=mid:0");
+    sdp_append(sdp, "a=rtcp-mux");
+    sdp_append(sdp, "a=rtcp-rsize");
+    return;
+  }
+
   sdp_append(sdp, "m=video 9 UDP/TLS/RTP/SAVPF 96");
   sdp_append(sdp, "c=IN IP4 0.0.0.0");
   sdp_append(sdp, "a=rtcp-fb:96 nack");
@@ -39,7 +69,20 @@ void sdp_append_h264(char* sdp) {
   sdp_append(sdp, "a=rtcp-mux");
 }
 
-void sdp_append_pcma(char* sdp) {
+void sdp_append_pcma(char* sdp, SdpProfile profile) {
+  if (sdp_profile_is_zlm_streaming(profile)) {
+    sdp_append(sdp, "m=audio 9 UDP/TLS/RTP/SAVPF 8");
+    sdp_append(sdp, "c=IN IP4 0.0.0.0");
+    sdp_append(sdp, "a=rtcp:9 IN IP4 0.0.0.0");
+    sdp_append(sdp, "a=rtpmap:8 PCMA/8000");
+    sdp_append(sdp, "a=ssrc:4 cname:webrtc-pcma");
+    sdp_append_media_direction(sdp, profile);
+    sdp_append(sdp, "a=mid:0");
+    sdp_append(sdp, "a=rtcp-mux");
+    sdp_append(sdp, "a=rtcp-rsize");
+    return;
+  }
+
   sdp_append(sdp, "m=audio 9 UDP/TLS/RTP/SAVP 8");
   sdp_append(sdp, "c=IN IP4 0.0.0.0");
   sdp_append(sdp, "a=rtpmap:8 PCMA/8000");
@@ -49,7 +92,20 @@ void sdp_append_pcma(char* sdp) {
   sdp_append(sdp, "a=rtcp-mux");
 }
 
-void sdp_append_pcmu(char* sdp) {
+void sdp_append_pcmu(char* sdp, SdpProfile profile) {
+  if (sdp_profile_is_zlm_streaming(profile)) {
+    sdp_append(sdp, "m=audio 9 UDP/TLS/RTP/SAVPF 0");
+    sdp_append(sdp, "c=IN IP4 0.0.0.0");
+    sdp_append(sdp, "a=rtcp:9 IN IP4 0.0.0.0");
+    sdp_append(sdp, "a=rtpmap:0 PCMU/8000");
+    sdp_append(sdp, "a=ssrc:5 cname:webrtc-pcmu");
+    sdp_append_media_direction(sdp, profile);
+    sdp_append(sdp, "a=mid:0");
+    sdp_append(sdp, "a=rtcp-mux");
+    sdp_append(sdp, "a=rtcp-rsize");
+    return;
+  }
+
   sdp_append(sdp, "m=audio 9 UDP/TLS/RTP/SAVP 0");
   sdp_append(sdp, "c=IN IP4 0.0.0.0");
   sdp_append(sdp, "a=rtpmap:0 PCMU/8000");
@@ -59,7 +115,21 @@ void sdp_append_pcmu(char* sdp) {
   sdp_append(sdp, "a=rtcp-mux");
 }
 
-void sdp_append_opus(char* sdp) {
+void sdp_append_opus(char* sdp, SdpProfile profile) {
+  if (sdp_profile_is_zlm_streaming(profile)) {
+    sdp_append(sdp, "m=audio 9 UDP/TLS/RTP/SAVPF 111");
+    sdp_append(sdp, "c=IN IP4 0.0.0.0");
+    sdp_append(sdp, "a=rtcp:9 IN IP4 0.0.0.0");
+    sdp_append(sdp, "a=fmtp:111 minptime=10;useinbandfec=1");
+    sdp_append(sdp, "a=rtpmap:111 opus/48000/2");
+    sdp_append(sdp, "a=ssrc:6 cname:webrtc-opus");
+    sdp_append_media_direction(sdp, profile);
+    sdp_append(sdp, "a=mid:0");
+    sdp_append(sdp, "a=rtcp-mux");
+    sdp_append(sdp, "a=rtcp-rsize");
+    return;
+  }
+
   sdp_append(sdp, "m=audio 9 UDP/TLS/RTP/SAVP 111");
   sdp_append(sdp, "c=IN IP4 0.0.0.0");
   sdp_append(sdp, "a=rtpmap:111 opus/48000/2");
@@ -69,7 +139,8 @@ void sdp_append_opus(char* sdp) {
   sdp_append(sdp, "a=rtcp-mux");
 }
 
-void sdp_append_datachannel(char* sdp) {
+void sdp_append_datachannel(char* sdp, SdpProfile profile) {
+  (void)profile;
   sdp_append(sdp, "m=application 50712 UDP/DTLS/SCTP webrtc-datachannel");
   sdp_append(sdp, "c=IN IP4 0.0.0.0");
   sdp_append(sdp, "a=mid:datachannel");
@@ -77,26 +148,42 @@ void sdp_append_datachannel(char* sdp) {
   sdp_append(sdp, "a=max-message-size:262144");
 }
 
-void sdp_create(char* sdp, int b_video, int b_audio, int b_datachannel) {
+void sdp_create(char* sdp, int b_video, int b_audio, int b_datachannel, SdpProfile profile) {
   char bundle[64];
+
   sdp_append(sdp, "v=0");
   sdp_append(sdp, "o=- 1495799811084970 1495799811084970 IN IP4 0.0.0.0");
   sdp_append(sdp, "s=-");
   sdp_append(sdp, "t=0 0");
-  sdp_append(sdp, "a=msid-semantic: iot");
+
+  if (sdp_profile_is_zlm_streaming(profile)) {
+    sdp_append(sdp, "a=extmap-allow-mixed");
+    sdp_append(sdp, "a=msid-semantic: WMS");
+    sdp_append(sdp, "a=ice-options:trickle");
+  } else {
+    sdp_append(sdp, "a=msid-semantic: iot");
+  }
+
 #if ICE_LITE
   sdp_append(sdp, "a=ice-lite");
 #endif
-  memset(bundle, 0, sizeof(bundle));
 
+  memset(bundle, 0, sizeof(bundle));
   strcat(bundle, "a=group:BUNDLE");
 
-  if (b_video) {
-    strcat(bundle, " video");
-  }
-
-  if (b_audio) {
-    strcat(bundle, " audio");
+  if (sdp_profile_is_zlm_streaming(profile)) {
+    if (b_video && b_audio) {
+      strcat(bundle, " 0 1");
+    } else if (b_video || b_audio) {
+      strcat(bundle, " 0");
+    }
+  } else {
+    if (b_video) {
+      strcat(bundle, " video");
+    }
+    if (b_audio) {
+      strcat(bundle, " audio");
+    }
   }
 
   if (b_datachannel) {

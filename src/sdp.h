@@ -10,17 +10,23 @@
 #define ICE_LITE 0
 #endif
 
-void sdp_append_h264(char* sdp);
+typedef enum SdpProfile {
+  SDP_PROFILE_P2P = 0,
+  SDP_PROFILE_WHIP,
+  SDP_PROFILE_WHEP,
+} SdpProfile;
 
-void sdp_append_pcma(char* sdp);
+void sdp_append_h264(char* sdp, SdpProfile profile);
 
-void sdp_append_pcmu(char* sdp);
+void sdp_append_pcma(char* sdp, SdpProfile profile);
 
-void sdp_append_opus(char* sdp);
+void sdp_append_pcmu(char* sdp, SdpProfile profile);
 
-void sdp_append_datachannel(char* sdp);
+void sdp_append_opus(char* sdp, SdpProfile profile);
 
-void sdp_create(char* sdp, int b_video, int b_audio, int b_datachannel);
+void sdp_append_datachannel(char* sdp, SdpProfile profile);
+
+void sdp_create(char* sdp, int b_video, int b_audio, int b_datachannel, SdpProfile profile);
 
 int sdp_append(char* sdp, const char* format, ...);
 

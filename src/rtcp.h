@@ -73,6 +73,8 @@ typedef struct RtcpFb {
 
 int rtcp_probe(uint8_t* packet, size_t size);
 
+int rtcp_build_sr(uint8_t* packet, int len, uint32_t ssrc, uint32_t rtp_timestamp, uint32_t packet_count, uint32_t octet_count);
+
 int rtcp_get_pli(uint8_t* packet, int len, uint32_t ssrc);
 
 int rtcp_get_fir(uint8_t* packet, int len, int* seqnr);

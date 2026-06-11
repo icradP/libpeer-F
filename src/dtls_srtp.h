@@ -81,6 +81,8 @@ int dtls_srtp_handshake(DtlsSrtp* dtls_srtp, Address* addr);
 
 void dtls_srtp_reset_session(DtlsSrtp* dtls_srtp);
 
+void dtls_srtp_reconfig(DtlsSrtp* dtls_srtp, DtlsSrtpRole role);
+
 int dtls_srtp_write(DtlsSrtp* dtls_srtp, const uint8_t* buf, size_t len);
 
 int dtls_srtp_read(DtlsSrtp* dtls_srtp, uint8_t* buf, size_t len);

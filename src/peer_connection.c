@@ -45,12 +45,66 @@ struct PeerConnection {
 
   uint32_t remote_assrc;
   uint32_t remote_vssrc;
+
+  uint32_t local_vpackets;
+  uint32_t local_voctets;
+  uint32_t local_apackets;
+  uint32_t local_aoctets;
+  uint32_t last_rtcp_sr_ms;
+  int dtls_handshake_started;
 };
+
+static void peer_connection_outgoing_rtcp_packet(PeerConnection* pc, uint8_t* data, size_t size) {
+  dtls_srtp_encrypt_rctp_packet(&pc->dtls_srtp, data, (int*)&size);
+  agent_send(&pc->agent, data, size);
+}
+
+static void peer_connection_maybe_send_rtcp_sr(PeerConnection* pc) {
+  uint32_t now = ports_get_epoch_time();
+  uint8_t rtcp_buf[128];
+  int len;
+
+  if (pc->last_rtcp_sr_ms != 0 && (now - pc->last_rtcp_sr_ms) < 5000)
+    return;
+
+  if (pc->config.video_codec != CODEC_NONE && pc->local_vpackets > 0) {
+    len = rtcp_build_sr(rtcp_buf, sizeof(rtcp_buf), pc->vrtp_encoder.ssrc, pc->vrtp_encoder.timestamp, pc->local_vpackets, pc->local_voctets);
+    if (len > 0)
+      peer_connection_outgoing_rtcp_packet(pc, rtcp_buf, len);
+  }
+
+  if (pc->config.audio_codec != CODEC_NONE && pc->local_apackets > 0) {
+    len = rtcp_build_sr(rtcp_buf, sizeof(rtcp_buf), pc->artp_encoder.ssrc, pc->artp_encoder.timestamp, pc->local_apackets, pc->local_aoctets);
+    if (len > 0)
+      peer_connection_outgoing_rtcp_packet(pc, rtcp_buf, len);
+  }
+
+  pc->last_rtcp_sr_ms = now;
+}
 
 static void peer_connection_outgoing_rtp_packet(uint8_t* data, size_t size, void* user_data) {
   PeerConnection* pc = (PeerConnection*)user_data;
+  uint32_t ssrc = rtp_get_ssrc(data);
+
+  if (ssrc == pc->vrtp_encoder.ssrc) {
+    pc->local_vpackets++;
+    pc->local_voctets += size;
+  } else if (ssrc == pc->artp_encoder.ssrc) {
+    pc->local_apackets++;
+    pc->local_aoctets += size;
+  }
+
   dtls_srtp_encrypt_rtp_packet(&pc->dtls_srtp, data, (int*)&size);
   agent_send(&pc->agent, data, size);
+  peer_connection_maybe_send_rtcp_sr(pc);
+}
+
+static int peer_connection_datagram_is_dtls(const uint8_t* buf, size_t len) {
+  if (buf == NULL || len < 1) {
+    return 0;
+  }
+
+  return buf[0] >= 20 && buf[0] <= 63;
 }
 
 static int peer_connection_dtls_srtp_recv(void* ctx, unsigned char* buf, size_t len) {
@@ -61,14 +115,19 @@ static int peer_connection_dtls_srtp_recv(void* ctx, unsigned char* buf, size_t 
 
   if (pc->agent_ret > 0 && pc->agent_ret <= len) {
     memcpy(buf, pc->agent_buf, pc->agent_ret);
-    return pc->agent_ret;
+    ret = pc->agent_ret;
+    pc->agent_ret = 0;
+    return ret;
   }
 
   while (recv_max < CONFIG_TLS_READ_TIMEOUT && pc->state == PEER_CONNECTION_CONNECTED) {
-    ret = agent_recv(&pc->agent, buf, len);
+    ret = agent_recv_datagram(&pc->agent, buf, len);
 
     if (ret > 0) {
-      break;
+      if (peer_connection_datagram_is_dtls((const uint8_t*)buf, ret)) {
+        return ret;
+      }
+      continue;
     }
 
     recv_max++;
@@ -165,19 +224,27 @@ PeerConnection* peer_connection_create(PeerConfiguration* config) {
   memset(&pc->sctp, 0, sizeof(pc->sctp));
 
   if (pc->config.audio_codec) {
-    rtp_encoder_init(&pc->artp_encoder, pc->config.audio_codec,
-                     peer_connection_outgoing_rtp_packet, (void*)pc);
+    if (pc->config.sdp_profile != SDP_PROFILE_WHEP) {
+      rtp_encoder_init(&pc->artp_encoder, pc->config.audio_codec,
+                       peer_connection_outgoing_rtp_packet, (void*)pc);
+    }
 
-    rtp_decoder_init(&pc->artp_decoder, pc->config.audio_codec,
-                     pc->config.onaudiotrack, pc->config.user_data);
+    if (pc->config.sdp_profile != SDP_PROFILE_WHIP) {
+      rtp_decoder_init(&pc->artp_decoder, pc->config.audio_codec,
+                       pc->config.onaudiotrack, pc->config.user_data);
+    }
   }
 
   if (pc->config.video_codec) {
-    rtp_encoder_init(&pc->vrtp_encoder, pc->config.video_codec,
-                     peer_connection_outgoing_rtp_packet, (void*)pc);
+    if (pc->config.sdp_profile != SDP_PROFILE_WHEP) {
+      rtp_encoder_init(&pc->vrtp_encoder, pc->config.video_codec,
+                       peer_connection_outgoing_rtp_packet, (void*)pc);
+    }
 
-    rtp_decoder_init(&pc->vrtp_decoder, pc->config.video_codec,
-                     pc->config.onvideotrack, pc->config.user_data);
+    if (pc->config.sdp_profile != SDP_PROFILE_WHIP) {
+      rtp_decoder_init(&pc->vrtp_decoder, pc->config.video_codec,
+                       pc->config.onvideotrack, pc->config.user_data);
+    }
   }
 
   return pc;
@@ -199,7 +266,9 @@ void peer_connection_close(PeerConnection* pc) {
 
 int peer_connection_send_audio(PeerConnection* pc, const uint8_t* buf, size_t len) {
   if (pc->state != PEER_CONNECTION_COMPLETED) {
-    // LOGE("dtls_srtp not connected");
+    return -1;
+  }
+  if (pc->config.audio_codec == CODEC_NONE) {
     return -1;
   }
   return rtp_encoder_encode(&pc->artp_encoder, buf, len);
@@ -207,7 +276,9 @@ int peer_connection_send_audio(PeerConnection* pc, const uint8_t* buf, size_t le
 
 int peer_connection_send_video(PeerConnection* pc, const uint8_t* buf, size_t len) {
   if (pc->state != PEER_CONNECTION_COMPLETED) {
-    // LOGE("dtls_srtp not connected");
+    return -1;
+  }
+  if (pc->config.video_codec == CODEC_NONE) {
     return -1;
   }
   return rtp_encoder_encode(&pc->vrtp_encoder, buf, len);
@@ -280,7 +351,10 @@ int peer_connection_create_datachannel_sid(PeerConnection* pc, DecpChannelType c
   return rtrn;
 }
 
-static char* peer_connection_dtls_role_setup_value(DtlsSrtpRole d) {
+static const char* peer_connection_dtls_role_setup_value(SdpType sdp_type, DtlsSrtpRole d) {
+  if (sdp_type == SDP_TYPE_OFFER) {
+    return "a=setup:actpass";
+  }
   return d == DTLS_SRTP_ROLE_SERVER ? "a=setup:passive" : "a=setup:active";
 }
 
@@ -294,16 +368,35 @@ int peer_connection_loop(PeerConnection* pc) {
       break;
 
     case PEER_CONNECTION_CHECKING:
-      if (agent_select_candidate_pair(&pc->agent) < 0) {
+      if (pc->config.skip_stun_check_keepalive) {
+        if (agent_skip_connectivity_check(&pc->agent) == 0) {
+          STATE_CHANGED(pc, PEER_CONNECTION_CONNECTED);
+        } else {
+          STATE_CHANGED(pc, PEER_CONNECTION_FAILED);
+        }
+      } else if (agent_select_candidate_pair(&pc->agent) < 0) {
         STATE_CHANGED(pc, PEER_CONNECTION_FAILED);
       } else if (agent_connectivity_check(&pc->agent) == 0) {
         STATE_CHANGED(pc, PEER_CONNECTION_CONNECTED);
       }
       break;
 
-    case PEER_CONNECTION_CONNECTED:
+    case PEER_CONNECTION_CONNECTED: {
+      Address* remote_addr = NULL;
+      if (pc->agent.selected_pair && pc->agent.selected_pair->remote) {
+        remote_addr = &pc->agent.selected_pair->remote->addr;
+      }
+      pc->dtls_srtp.udp_send = peer_connection_dtls_srtp_send;
+      pc->dtls_srtp.udp_recv = peer_connection_dtls_srtp_recv;
 
-      if (dtls_srtp_handshake(&pc->dtls_srtp, NULL) == 0) {
+      if (pc->dtls_handshake_started) {
+        break;
+      }
+      pc->dtls_handshake_started = 1;
+
+      agent_drain_pending(&pc->agent);
+
+      if (dtls_srtp_handshake(&pc->dtls_srtp, remote_addr) == 0) {
         LOGD("DTLS-SRTP handshake done");
 
         if (pc->config.datachannel) {
@@ -313,8 +406,11 @@ int peer_connection_loop(PeerConnection* pc) {
         }
 
         STATE_CHANGED(pc, PEER_CONNECTION_COMPLETED);
+      } else {
+        dtls_srtp_reset_session(&pc->dtls_srtp);
+        STATE_CHANGED(pc, PEER_CONNECTION_FAILED);
       }
-      break;
+      } break;
     case PEER_CONNECTION_COMPLETED:
       if ((pc->agent_ret = agent_recv(&pc->agent, pc->agent_buf, sizeof(pc->agent_buf))) > 0) {
         LOGD("agent_recv %d", pc->agent_ret);
@@ -349,7 +445,9 @@ int peer_connection_loop(PeerConnection* pc) {
         }
       }
 
-      if (CONFIG_KEEPALIVE_TIMEOUT > 0 && (ports_get_epoch_time() - pc->agent.binding_request_time) > CONFIG_KEEPALIVE_TIMEOUT) {
+      if (!pc->config.skip_stun_check_keepalive &&
+          CONFIG_KEEPALIVE_TIMEOUT > 0 &&
+          (ports_get_epoch_time() - pc->agent.binding_request_time) > CONFIG_KEEPALIVE_TIMEOUT) {
         LOGI("binding request timeout");
         STATE_CHANGED(pc, PEER_CONNECTION_CLOSED);
       }
@@ -368,27 +466,108 @@ int peer_connection_loop(PeerConnection* pc) {
   return 0;
 }
 
+static void peer_connection_copy_fingerprint(char* dst, size_t dst_len, const char* line) {
+  const char* fp = strstr(line, "sha-256");
+  if (!fp) {
+    fp = strstr(line, "SHA-256");
+  }
+  if (!fp) {
+    return;
+  }
+
+  fp = strchr(fp, ' ');
+  if (!fp) {
+    return;
+  }
+
+  while (*fp == ' ') {
+    fp++;
+  }
+
+  strncpy(dst, fp, dst_len - 1);
+  dst[dst_len - 1] = '\0';
+}
+
+static int sdp_mline_first_payload_type(const char* line) {
+  const char* pos = strstr(line, "SAVPF ");
+  if (!pos) {
+    pos = strstr(line, "SAVP ");
+  }
+  if (!pos) {
+    return -1;
+  }
+  return atoi(pos + 6);
+}
+
+static void peer_connection_apply_answer_codec(PeerConnection* pc, const char* media,
+                                               int payload_type, const char* rtpmap_line) {
+  int pt = payload_type;
+  int clock_rate = 0;
+  char codec_name[32] = {0};
+
+  if (rtpmap_line && sscanf(rtpmap_line, "a=rtpmap:%d %31[^/]/%d", &pt, codec_name, &clock_rate) >= 2) {
+    if (clock_rate == 0) {
+      clock_rate = 8000;
+    }
+  } else if (pt < 0) {
+    return;
+  } else {
+    clock_rate = 8000;
+  }
+
+  if (strcmp(media, "audio") == 0 && pc->config.audio_codec != CODEC_NONE) {
+    if (pc->config.sdp_profile != SDP_PROFILE_WHEP) {
+      rtp_encoder_set_payload(&pc->artp_encoder, (uint8_t)pt, (uint32_t)clock_rate);
+    }
+    if (pc->config.sdp_profile != SDP_PROFILE_WHIP) {
+      rtp_decoder_set_payload(&pc->artp_decoder, (uint8_t)pt);
+    }
+    LOGI("Negotiated audio codec %s PT=%d clock=%d", codec_name[0] ? codec_name : "PCMA", pt, clock_rate);
+  } else if (strcmp(media, "video") == 0 && pc->config.video_codec != CODEC_NONE) {
+    if (pc->config.sdp_profile != SDP_PROFILE_WHEP) {
+      pc->vrtp_encoder.type = (uint8_t)pt;
+      if (clock_rate > 0) {
+        pc->vrtp_encoder.timestamp_increment = clock_rate / 30;
+      }
+    }
+    if (pc->config.sdp_profile != SDP_PROFILE_WHIP) {
+      rtp_decoder_set_payload(&pc->vrtp_decoder, (uint8_t)pt);
+    }
+    LOGI("Negotiated video codec %s PT=%d clock=%d", codec_name[0] ? codec_name : "H264", pt, clock_rate);
+  }
+}
+
 void peer_connection_set_remote_description(PeerConnection* pc, const char* sdp, SdpType type) {
   char* start = (char*)sdp;
   char* line = NULL;
   char buf[256];
   char* val_start = NULL;
   uint32_t* ssrc = NULL;
+  int has_setup = 0;
   DtlsSrtpRole role = DTLS_SRTP_ROLE_SERVER;
   int is_update = 0;
   Agent* agent = &pc->agent;
+  const char* current_media = NULL;
 
   while ((line = strstr(start, "\r\n"))) {
     line = strstr(start, "\r\n");
     strncpy(buf, start, line - start);
     buf[line - start] = '\0';
 
-    if (strstr(buf, "a=setup:passive")) {
+    if (strstr(buf, "a=setup:active")) {
+      // remote will initiate DTLS -> we are server (passive)
+      role = DTLS_SRTP_ROLE_SERVER;
+      has_setup = 1;
+    } else if (strstr(buf, "a=setup:passive")) {
+      // remote waits -> we are client (active, must initiate)
       role = DTLS_SRTP_ROLE_CLIENT;
+      has_setup = 1;
     }
 
     if (strstr(buf, "a=fingerprint")) {
-      strncpy(pc->dtls_srtp.remote_fingerprint, buf + 22, DTLS_SRTP_FINGERPRINT_LENGTH);
+      peer_connection_copy_fingerprint(pc->dtls_srtp.remote_fingerprint,
+                                       sizeof(pc->dtls_srtp.remote_fingerprint),
+                                       buf);
     }
 
     if (strstr(buf, "a=ice-ufrag") &&
@@ -397,10 +576,25 @@ void peer_connection_set_remote_description(PeerConnection* pc, const char* sdp,
       is_update = 1;
     }
 
-    if (strstr(buf, "m=video")) {
-      ssrc = &pc->remote_vssrc;
-    } else if (strstr(buf, "m=audio")) {
+    if (strncmp(buf, "m=audio", 7) == 0) {
+      current_media = "audio";
       ssrc = &pc->remote_assrc;
+      if (type == SDP_TYPE_ANSWER) {
+        peer_connection_apply_answer_codec(pc, "audio", sdp_mline_first_payload_type(buf), NULL);
+      }
+    } else if (strncmp(buf, "m=video", 7) == 0) {
+      current_media = "video";
+      ssrc = &pc->remote_vssrc;
+      if (type == SDP_TYPE_ANSWER) {
+        peer_connection_apply_answer_codec(pc, "video", sdp_mline_first_payload_type(buf), NULL);
+      }
+    } else if (strncmp(buf, "m=", 2) == 0) {
+      current_media = NULL;
+      ssrc = NULL;
+    }
+
+    if (type == SDP_TYPE_ANSWER && current_media && strncmp(buf, "a=rtpmap:", 9) == 0) {
+      peer_connection_apply_answer_codec(pc, current_media, -1, buf);
     }
 
     if ((val_start = strstr(buf, "a=ssrc:")) && ssrc) {
@@ -414,6 +608,13 @@ void peer_connection_set_remote_description(PeerConnection* pc, const char* sdp,
   if (is_update) {
     return;
   }
+
+  // Reconfigure DTLS role based on remote's setup value
+  if (has_setup && type == SDP_TYPE_ANSWER) {
+    dtls_srtp_reconfig(&pc->dtls_srtp, role);
+  }
+
+  pc->dtls_handshake_started = 0;
 
   agent_set_remote_description(&pc->agent, (char*)sdp);
   if (type == SDP_TYPE_ANSWER) {
@@ -454,33 +655,35 @@ static const char* peer_connection_create_sdp(PeerConnection* pc, SdpType sdp_ty
   sdp_create(pc->sdp,
              pc->config.video_codec != CODEC_NONE,
              pc->config.audio_codec != CODEC_NONE,
-             pc->config.datachannel);
+             pc->config.datachannel,
+             pc->config.sdp_profile);
 
   agent_create_ice_credential(&pc->agent);
   sdp_append(pc->sdp, "a=ice-ufrag:%s", pc->agent.local_ufrag);
   sdp_append(pc->sdp, "a=ice-pwd:%s", pc->agent.local_upwd);
   sdp_append(pc->sdp, "a=fingerprint:sha-256 %s", pc->dtls_srtp.local_fingerprint);
-  sdp_append(pc->sdp, peer_connection_dtls_role_setup_value(role));
+  sdp_append(pc->sdp, peer_connection_dtls_role_setup_value(sdp_type, role));
 
   if (pc->config.video_codec == CODEC_H264) {
-    sdp_append_h264(pc->sdp);
+    sdp_append_h264(pc->sdp, pc->config.sdp_profile);
   }
 
   switch (pc->config.audio_codec) {
     case CODEC_PCMA:
-      sdp_append_pcma(pc->sdp);
+      sdp_append_pcma(pc->sdp, pc->config.sdp_profile);
       break;
     case CODEC_PCMU:
-      sdp_append_pcmu(pc->sdp);
+      sdp_append_pcmu(pc->sdp, pc->config.sdp_profile);
       break;
     case CODEC_OPUS:
-      sdp_append_opus(pc->sdp);
+      sdp_append_opus(pc->sdp, pc->config.sdp_profile);
+      break;
     default:
       break;
   }
 
   if (pc->config.datachannel) {
-    sdp_append_datachannel(pc->sdp);
+    sdp_append_datachannel(pc->sdp, pc->config.sdp_profile);
   }
 
   pc->b_local_description_created = 1;

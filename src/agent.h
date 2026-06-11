@@ -82,11 +82,17 @@ int agent_send(Agent* agent, const uint8_t* buf, int len);
 
 int agent_recv(Agent* agent, uint8_t* buf, int len);
 
+int agent_recv_datagram(Agent* agent, uint8_t* buf, int len);
+
+void agent_drain_pending(Agent* agent);
+
 void agent_set_remote_description(Agent* agent, char* description);
 
 int agent_select_candidate_pair(Agent* agent);
 
 int agent_connectivity_check(Agent* agent);
+
+int agent_skip_connectivity_check(Agent* agent);
 
 void agent_clear_candidates(Agent* agent);
 

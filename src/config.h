@@ -12,7 +12,7 @@
 #endif
 
 #ifndef CONFIG_MBEDTLS_DEBUG
-#define CONFIG_MBEDTLS_DEBUG 0
+#define CONFIG_MBEDTLS_DEBUG 1
 #endif
 
 #ifndef CONFIG_MBEDTLS_2_X
@@ -50,7 +50,7 @@
 #endif
 
 #ifndef CONFIG_KEEPALIVE_TIMEOUT
-#define CONFIG_KEEPALIVE_TIMEOUT 10000
+#define CONFIG_KEEPALIVE_TIMEOUT 0
 #endif
 
 #ifndef CONFIG_AUDIO_DURATION
@@ -65,7 +65,7 @@
 // empty will use first active interface
 #define CONFIG_IFACE_PREFIX ""
 
-// #define LOG_LEVEL LEVEL_DEBUG
+#define LOG_LEVEL LEVEL_DEBUG
 #ifndef LOG_REDIRECT
 #define LOG_REDIRECT 0
 #endif

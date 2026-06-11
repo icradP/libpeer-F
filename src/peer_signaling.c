@@ -340,7 +340,23 @@ static int peer_signaling_http_post(const char* hostname, const char* path, int 
       "Response Headers: %s\nResponse Status: %u\nResponse Body: %s\n",
       hostname, path, res.pHeaders, res.statusCode, res.pBody);
 
-  if (res.statusCode == 201) {
+  if (res.statusCode == 200) {
+    // JSON response - extract SDP from JSON
+    cJSON* json = cJSON_Parse((const char*)res.pBody);
+    if (json) {
+      cJSON* sdp = cJSON_GetObjectItem(json, "sdp");
+      if (sdp && cJSON_IsString(sdp)) {
+        LOGI("Extracted SDP from JSON response");
+        peer_connection_set_remote_description(g_ps.pc, sdp->valuestring, SDP_TYPE_ANSWER);
+      } else {
+        LOGE("Failed to extract SDP from JSON response");
+      }
+      cJSON_Delete(json);
+    } else {
+      LOGE("Failed to parse JSON response");
+    }
+  } else if (res.statusCode == 201) {
+    // SDP response - use body directly
     peer_connection_set_remote_description(g_ps.pc, (const char*)res.pBody, SDP_TYPE_ANSWER);
   }
   return 0;
