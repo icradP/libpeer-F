@@ -1,3 +1,4 @@
+#include <inttypes.h>
 #include <stdarg.h>
 #include <stdio.h>
 
@@ -40,7 +41,7 @@ void sdp_reset(char* sdp) {
   memset(sdp, 0, CONFIG_SDP_BUFFER_SIZE);
 }
 
-void sdp_append_h264(char* sdp, SdpProfile profile) {
+void sdp_append_h264(char* sdp, SdpProfile profile, uint32_t ssrc) {
   if (sdp_profile_is_zlm_streaming(profile)) {
     sdp_append(sdp, "m=video 9 UDP/TLS/RTP/SAVPF 96");
     sdp_append(sdp, "c=IN IP4 0.0.0.0");
@@ -49,7 +50,7 @@ void sdp_append_h264(char* sdp, SdpProfile profile) {
     sdp_append(sdp, "a=rtcp-fb:96 nack pli");
     sdp_append(sdp, "a=fmtp:96 profile-level-id=42e01f;level-asymmetry-allowed=1");
     sdp_append(sdp, "a=rtpmap:96 H264/90000");
-    sdp_append(sdp, "a=ssrc:1 cname:webrtc-h264");
+    sdp_append(sdp, "a=ssrc:%" PRIu32 " cname:webrtc-h264", ssrc);
     sdp_append_media_direction(sdp, profile);
     sdp_append(sdp, "a=mid:0");
     sdp_append(sdp, "a=rtcp-mux");
@@ -63,19 +64,19 @@ void sdp_append_h264(char* sdp, SdpProfile profile) {
   sdp_append(sdp, "a=rtcp-fb:96 nack pli");
   sdp_append(sdp, "a=fmtp:96 profile-level-id=42e01f;level-asymmetry-allowed=1");
   sdp_append(sdp, "a=rtpmap:96 H264/90000");
-  sdp_append(sdp, "a=ssrc:1 cname:webrtc-h264");
+  sdp_append(sdp, "a=ssrc:%" PRIu32 " cname:webrtc-h264", ssrc);
   sdp_append(sdp, "a=sendrecv");
   sdp_append(sdp, "a=mid:video");
   sdp_append(sdp, "a=rtcp-mux");
 }
 
-void sdp_append_pcma(char* sdp, SdpProfile profile) {
+void sdp_append_pcma(char* sdp, SdpProfile profile, uint32_t ssrc) {
   if (sdp_profile_is_zlm_streaming(profile)) {
     sdp_append(sdp, "m=audio 9 UDP/TLS/RTP/SAVPF 8");
     sdp_append(sdp, "c=IN IP4 0.0.0.0");
     sdp_append(sdp, "a=rtcp:9 IN IP4 0.0.0.0");
     sdp_append(sdp, "a=rtpmap:8 PCMA/8000");
-    sdp_append(sdp, "a=ssrc:4 cname:webrtc-pcma");
+    sdp_append(sdp, "a=ssrc:%" PRIu32 " cname:webrtc-pcma", ssrc);
     sdp_append_media_direction(sdp, profile);
     sdp_append(sdp, "a=mid:0");
     sdp_append(sdp, "a=rtcp-mux");
@@ -86,19 +87,19 @@ void sdp_append_pcma(char* sdp, SdpProfile profile) {
   sdp_append(sdp, "m=audio 9 UDP/TLS/RTP/SAVP 8");
   sdp_append(sdp, "c=IN IP4 0.0.0.0");
   sdp_append(sdp, "a=rtpmap:8 PCMA/8000");
-  sdp_append(sdp, "a=ssrc:4 cname:webrtc-pcma");
+  sdp_append(sdp, "a=ssrc:%" PRIu32 " cname:webrtc-pcma", ssrc);
   sdp_append(sdp, "a=sendrecv");
   sdp_append(sdp, "a=mid:audio");
   sdp_append(sdp, "a=rtcp-mux");
 }
 
-void sdp_append_pcmu(char* sdp, SdpProfile profile) {
+void sdp_append_pcmu(char* sdp, SdpProfile profile, uint32_t ssrc) {
   if (sdp_profile_is_zlm_streaming(profile)) {
     sdp_append(sdp, "m=audio 9 UDP/TLS/RTP/SAVPF 0");
     sdp_append(sdp, "c=IN IP4 0.0.0.0");
     sdp_append(sdp, "a=rtcp:9 IN IP4 0.0.0.0");
     sdp_append(sdp, "a=rtpmap:0 PCMU/8000");
-    sdp_append(sdp, "a=ssrc:5 cname:webrtc-pcmu");
+    sdp_append(sdp, "a=ssrc:%" PRIu32 " cname:webrtc-pcmu", ssrc);
     sdp_append_media_direction(sdp, profile);
     sdp_append(sdp, "a=mid:0");
     sdp_append(sdp, "a=rtcp-mux");
@@ -109,20 +110,20 @@ void sdp_append_pcmu(char* sdp, SdpProfile profile) {
   sdp_append(sdp, "m=audio 9 UDP/TLS/RTP/SAVP 0");
   sdp_append(sdp, "c=IN IP4 0.0.0.0");
   sdp_append(sdp, "a=rtpmap:0 PCMU/8000");
-  sdp_append(sdp, "a=ssrc:5 cname:webrtc-pcmu");
+  sdp_append(sdp, "a=ssrc:%" PRIu32 " cname:webrtc-pcmu", ssrc);
   sdp_append(sdp, "a=sendrecv");
   sdp_append(sdp, "a=mid:audio");
   sdp_append(sdp, "a=rtcp-mux");
 }
 
-void sdp_append_opus(char* sdp, SdpProfile profile) {
+void sdp_append_opus(char* sdp, SdpProfile profile, uint32_t ssrc) {
   if (sdp_profile_is_zlm_streaming(profile)) {
     sdp_append(sdp, "m=audio 9 UDP/TLS/RTP/SAVPF 111");
     sdp_append(sdp, "c=IN IP4 0.0.0.0");
     sdp_append(sdp, "a=rtcp:9 IN IP4 0.0.0.0");
     sdp_append(sdp, "a=fmtp:111 minptime=10;useinbandfec=1");
     sdp_append(sdp, "a=rtpmap:111 opus/48000/2");
-    sdp_append(sdp, "a=ssrc:6 cname:webrtc-opus");
+    sdp_append(sdp, "a=ssrc:%" PRIu32 " cname:webrtc-opus", ssrc);
     sdp_append_media_direction(sdp, profile);
     sdp_append(sdp, "a=mid:0");
     sdp_append(sdp, "a=rtcp-mux");
@@ -133,7 +134,7 @@ void sdp_append_opus(char* sdp, SdpProfile profile) {
   sdp_append(sdp, "m=audio 9 UDP/TLS/RTP/SAVP 111");
   sdp_append(sdp, "c=IN IP4 0.0.0.0");
   sdp_append(sdp, "a=rtpmap:111 opus/48000/2");
-  sdp_append(sdp, "a=ssrc:6 cname:webrtc-opus");
+  sdp_append(sdp, "a=ssrc:%" PRIu32 " cname:webrtc-opus", ssrc);
   sdp_append(sdp, "a=sendrecv");
   sdp_append(sdp, "a=mid:audio");
   sdp_append(sdp, "a=rtcp-mux");

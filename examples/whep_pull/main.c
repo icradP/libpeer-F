@@ -73,7 +73,7 @@ static void on_video_track(uint8_t* data, size_t size, void* userdata) {
 }
 
 static void print_usage(const char* prog) {
-  printf("用法: %s -u <whep_url> [-t <token>] [-o <alaw_out>] [-O <h264_out>] [-v]\n", prog);
+  printf("用法: %s -u <whep_url> [-t <token>] [-o <alaw_out>] [-O <h264_out>] [-v] [--audio-ssrc <ssrc>] [--video-ssrc <ssrc>]\n", prog);
   printf("\n参数:\n");
   printf("  -u <url>    WHEP 端点 URL (必填)\n");
   printf("              示例: http://host/index/api/whep?app=live&stream=mic\n");
@@ -82,6 +82,8 @@ static void print_usage(const char* prog) {
   printf("  -o <file>   将收到的 PCMA 音频写入 A-law 原始文件 (可选)\n");
   printf("  -O <file>   将收到的 H264 Annex-B 写入文件 (需 -v)\n");
   printf("  -v          SDP 中声明接收视频轨\n");
+  printf("  --audio-ssrc <ssrc>  指定本地音频 RTCP SSRC; 省略或 0 时自动随机生成\n");
+  printf("  --video-ssrc <ssrc>  指定本地视频 RTCP SSRC; 省略或 0 时自动随机生成\n");
 }
 
 static void* peer_connection_task(void* data) {
@@ -97,6 +99,8 @@ int main(int argc, char* argv[]) {
   const char* token = NULL;
   const char* audio_out = NULL;
   const char* video_out = NULL;
+  uint32_t audio_ssrc = 0;
+  uint32_t video_ssrc = 0;
   int enable_video = 0;
 
   for (int i = 1; i < argc; i++) {
@@ -110,6 +114,10 @@ int main(int argc, char* argv[]) {
       video_out = argv[++i];
     } else if (strcmp(argv[i], "-v") == 0) {
       enable_video = 1;
+    } else if (strcmp(argv[i], "--audio-ssrc") == 0 && i + 1 < argc) {
+      audio_ssrc = (uint32_t)strtoul(argv[++i], NULL, 10);
+    } else if (strcmp(argv[i], "--video-ssrc") == 0 && i + 1 < argc) {
+      video_ssrc = (uint32_t)strtoul(argv[++i], NULL, 10);
     } else {
       print_usage(argv[0]);
       return 1;
@@ -130,6 +138,8 @@ int main(int argc, char* argv[]) {
   printf(" Token:    %s\n", token ? token : "(无)");
   printf(" 音频输出: %s\n", audio_out ? audio_out : "(仅统计, 不写文件)");
   printf(" 视频:     %s\n", enable_video ? (video_out ? video_out : "接收 (不写文件)") : "未启用");
+  printf(" Audio SSRC: %u%s\n", audio_ssrc, audio_ssrc ? "" : " (auto)");
+  printf(" Video SSRC: %u%s\n", video_ssrc, video_ssrc ? "" : " (auto)");
   printf("========================================\n\n");
 
   if (audio_out) {
@@ -162,6 +172,8 @@ int main(int argc, char* argv[]) {
       .audio_codec = CODEC_PCMA,
       .sdp_profile = SDP_PROFILE_WHEP,
       .skip_stun_check_keepalive = 1,
+      .local_audio_ssrc = audio_ssrc,
+      .local_video_ssrc = video_ssrc,
       .onaudiotrack = on_audio_track,
       .onvideotrack = enable_video ? on_video_track : NULL,
   };

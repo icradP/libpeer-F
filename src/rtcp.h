@@ -1,6 +1,9 @@
 #ifndef RTCP_H_
 #define RTCP_H_
 
+#include <stddef.h>
+#include <stdint.h>
+
 #ifdef __BYTE_ORDER
 #define __BIG_ENDIAN 4321
 #define __LITTLE_ENDIAN 1234
@@ -74,6 +77,10 @@ typedef struct RtcpFb {
 int rtcp_probe(uint8_t* packet, size_t size);
 
 int rtcp_build_sr(uint8_t* packet, int len, uint32_t ssrc, uint32_t rtp_timestamp, uint32_t packet_count, uint32_t octet_count);
+
+int rtcp_build_rr(uint8_t* packet, int len, uint32_t receiver_ssrc, uint32_t media_ssrc);
+
+int rtcp_build_bye(uint8_t* packet, int len, uint32_t ssrc);
 
 int rtcp_get_pli(uint8_t* packet, int len, uint32_t ssrc);
 

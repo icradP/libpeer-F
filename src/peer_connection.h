@@ -89,6 +89,13 @@ typedef struct PeerConfiguration {
    */
   int skip_stun_check_keepalive;
 
+  /**
+   * Optional local SSRC values. Set to 0 to let libpeer generate random SSRCs.
+   * Audio and video SSRCs must be unique within a PeerConnection.
+   */
+  uint32_t local_audio_ssrc;
+  uint32_t local_video_ssrc;
+
   void (*onaudiotrack)(uint8_t* data, size_t size, void* userdata);
   void (*onvideotrack)(uint8_t* data, size_t size, void* userdata);
   void (*on_request_keyframe)(void* userdata);

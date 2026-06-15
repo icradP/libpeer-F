@@ -148,6 +148,22 @@ uint32_t ports_get_epoch_time() {
   return (uint32_t)tv.tv_sec * 1000 + tv.tv_usec / 1000;
 }
 
+uint32_t ports_random_u32() {
+  static uint32_t state = 0;
+
+  if (state == 0) {
+    state = ports_get_epoch_time() ^ (uint32_t)(uintptr_t)&state ^ (uint32_t)rand();
+    if (state == 0) {
+      state = 0x6d2b79f5;
+    }
+  }
+
+  state ^= state << 13;
+  state ^= state >> 17;
+  state ^= state << 5;
+  return state;
+}
+
 void ports_sleep_ms(int ms) {
 #if CONFIG_USE_LWIP
   sys_msleep(ms);

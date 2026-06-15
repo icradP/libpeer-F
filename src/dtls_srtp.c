@@ -398,8 +398,6 @@ static void dtls_srtp_key_derivation_cb(void* context,
 }
 
 static int dtls_srtp_do_handshake(DtlsSrtp* dtls_srtp) {
-  int ret;
-
   static mbedtls_timing_delay_context timer;
 
   mbedtls_ssl_set_timer_cb(&dtls_srtp->ssl, &timer, mbedtls_timing_set_delay, mbedtls_timing_get_delay);
@@ -412,18 +410,15 @@ static int dtls_srtp_do_handshake(DtlsSrtp* dtls_srtp) {
 
   mbedtls_ssl_set_bio(&dtls_srtp->ssl, dtls_srtp, dtls_srtp->udp_send, dtls_srtp->udp_recv, NULL);
 
-  do {
-    ret = mbedtls_ssl_handshake(&dtls_srtp->ssl);
-
-  } while (ret == MBEDTLS_ERR_SSL_WANT_READ || ret == MBEDTLS_ERR_SSL_WANT_WRITE);
-
-  return ret;
+  return mbedtls_ssl_handshake(&dtls_srtp->ssl);
 }
 
 static int dtls_srtp_handshake_server(DtlsSrtp* dtls_srtp) {
   int ret;
+  int attempts = 0;
+  int reset_session = 1;
 
-  while (1) {
+  while (attempts < 100) {
     unsigned char client_ip[16];
     int client_ip_len = 0;
 
@@ -440,14 +435,23 @@ static int dtls_srtp_handshake_server(DtlsSrtp* dtls_srtp) {
       client_ip_len = 4;
     }
 
-    mbedtls_ssl_session_reset(&dtls_srtp->ssl);
+    if (reset_session) {
+      mbedtls_ssl_session_reset(&dtls_srtp->ssl);
 
-    mbedtls_ssl_set_client_transport_id(&dtls_srtp->ssl, client_ip, client_ip_len);
+      mbedtls_ssl_set_client_transport_id(&dtls_srtp->ssl, client_ip, client_ip_len);
+      reset_session = 0;
+    }
 
     ret = dtls_srtp_do_handshake(dtls_srtp);
 
     if (ret == MBEDTLS_ERR_SSL_HELLO_VERIFY_REQUIRED) {
       LOGD("DTLS hello verification requested");
+      reset_session = 1;
+
+    } else if (ret == MBEDTLS_ERR_SSL_WANT_READ || ret == MBEDTLS_ERR_SSL_WANT_WRITE) {
+      attempts++;
+      ports_sleep_ms(50);
+      continue;
 
     } else if (ret != 0) {
       LOGE("failed! mbedtls_ssl_handshake returned -0x%.4x", (unsigned int)-ret);

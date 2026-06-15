@@ -12,7 +12,7 @@ if (DEFINED ENV{IDF_PATH})
    PRIV_INCLUDE_DIRS "./src"
    REQUIRES mbedtls srtp json esp_netif
   )
-  add_definitions("-DCONFIG_USE_LWIP=1" "-DCONFIG_USE_USRSCTP=0" "-DCONFIG_AUDIO_BUFFER_SIZE=8096" "-DCONFIG_DATA_BUFFER_SIZE=102400" "-D__BYTE_ORDER=__LITTLE_ENDIAN" "-DHTTP_DO_NOT_USE_CUSTOM_CONFIG" "-DMQTT_DO_NOT_USE_CUSTOM_CONFIG")
+  add_definitions("-DCONFIG_USE_LWIP=1" "-DCONFIG_USE_USRSCTP=0" "-DCONFIG_AUDIO_BUFFER_SIZE=8096" "-DCONFIG_DATA_BUFFER_SIZE=102400" "-D__BYTE_ORDER=__LITTLE_ENDIAN" "-DHTTP_DO_NOT_USE_CUSTOM_CONFIG" "-DHTTP_RECV_RETRY_TIMEOUT_MS=60000U" "-DHTTP_SEND_RETRY_TIMEOUT_MS=5000U" "-DMQTT_DO_NOT_USE_CUSTOM_CONFIG")
   return()
 endif()
 
@@ -59,7 +59,7 @@ if(UNDEFINED_BEHAVIOR_SANITIZER)
   enableSanitizer("undefined")
 endif()
 
-add_definitions("-Wunused-variable -Werror=sequence-point -Werror=pointer-sign -Werror=return-type -Werror=sizeof-pointer-memaccess -Wincompatible-pointer-types -DHTTP_DO_NOT_USE_CUSTOM_CONFIG -DMQTT_DO_NOT_USE_CUSTOM_CONFIG")
+add_definitions("-Wunused-variable -Werror=sequence-point -Werror=pointer-sign -Werror=return-type -Werror=sizeof-pointer-memaccess -Wincompatible-pointer-types -DHTTP_DO_NOT_USE_CUSTOM_CONFIG -DHTTP_RECV_RETRY_TIMEOUT_MS=60000U -DHTTP_SEND_RETRY_TIMEOUT_MS=5000U -DMQTT_DO_NOT_USE_CUSTOM_CONFIG")
 
 add_subdirectory(src)
 add_subdirectory(examples)

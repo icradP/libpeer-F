@@ -130,6 +130,12 @@ int32_t ssl_transport_recv(NetworkContext_t* net_ctx, void* buf, size_t len) {
   memset(buf, 0, len);
   ret = mbedtls_ssl_read(&net_ctx->ssl, buf, len);
 
+  if (ret == MBEDTLS_ERR_SSL_WANT_READ ||
+      ret == MBEDTLS_ERR_SSL_WANT_WRITE ||
+      ret == MBEDTLS_ERR_SSL_TIMEOUT) {
+    return 0;
+  }
+
   return ret;
 }
 

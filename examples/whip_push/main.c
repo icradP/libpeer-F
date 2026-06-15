@@ -102,7 +102,7 @@ static int generate_test_pcma_frame(uint8_t* buf) {
 }
 
 static void print_usage(const char* prog) {
-  printf("用法: %s -u <whip_url> [-t <token>] [-a <alaw_file>] [-v <h264_file>]\n", prog);
+  printf("用法: %s -u <whip_url> [-t <token>] [-a <alaw_file>] [-v <h264_file>] [--audio-ssrc <ssrc>] [--video-ssrc <ssrc>]\n", prog);
   printf("\n参数:\n");
   printf("  -u <url>    WHIP 端点 URL (必填)\n");
   printf("              示例: http://192.168.1.100:80/index/api/whip?app=live&stream=camera1\n");
@@ -110,9 +110,12 @@ static void print_usage(const char* prog) {
   printf("  -a <file>   A-law 原始音频 (8kHz mono); 省略则默认推送测试音频\n");
   printf("  -v <file>   H264 Annex-B 视频; 仅指定 -v 时启用视频轨\n");
   printf("              省略 -v 则 SDP/推流均不含视频\n");
+  printf("  --audio-ssrc <ssrc>  指定本地音频 SSRC; 省略或 0 时自动随机生成\n");
+  printf("  --video-ssrc <ssrc>  指定本地视频 SSRC; 省略或 0 时自动随机生成\n");
   printf("\n示例:\n");
   printf("  %s -u http://192.168.1.100/index/api/whip?app=live&stream=mic -a mic.alaw\n", prog);
   printf("  %s -u http://192.168.1.100/index/api/whip?app=live&stream=cam -v cam.h264 -a mic.alaw\n", prog);
+  printf("  %s -u http://192.168.1.100/index/api/whip?app=live&stream=cam --audio-ssrc 12345678 --video-ssrc 87654321\n", prog);
 }
 
 static uint64_t get_timestamp_ms(void) {
@@ -137,6 +140,8 @@ int main(int argc, char* argv[]) {
   const char* token = NULL;
   const char* video_file = NULL;
   const char* audio_file = NULL;
+  uint32_t audio_ssrc = 0;
+  uint32_t video_ssrc = 0;
   int enable_video = 0;
 
   // 解析命令行参数
@@ -152,6 +157,10 @@ int main(int argc, char* argv[]) {
       }
     } else if (strcmp(argv[i], "-a") == 0 && i + 1 < argc) {
       audio_file = argv[++i];
+    } else if (strcmp(argv[i], "--audio-ssrc") == 0 && i + 1 < argc) {
+      audio_ssrc = (uint32_t)strtoul(argv[++i], NULL, 10);
+    } else if (strcmp(argv[i], "--video-ssrc") == 0 && i + 1 < argc) {
+      video_ssrc = (uint32_t)strtoul(argv[++i], NULL, 10);
     } else {
       print_usage(argv[0]);
       return 1;
@@ -172,6 +181,8 @@ int main(int argc, char* argv[]) {
   printf(" Token:    %s\n", token ? token : "(无)");
   printf(" 视频:     %s\n", enable_video ? (video_file ? video_file : "内置测试数据 (H264)") : "未启用");
   printf(" 音频:     %s\n", audio_file ? audio_file : "内置测试数据 (PCMA)");
+  printf(" Audio SSRC: %u%s\n", audio_ssrc, audio_ssrc ? "" : " (auto)");
+  printf(" Video SSRC: %u%s\n", video_ssrc, video_ssrc ? "" : " (auto)");
   printf("========================================\n\n");
 
   // 初始化 WebRTC 库
@@ -187,6 +198,8 @@ int main(int argc, char* argv[]) {
       .audio_codec = CODEC_PCMA,
       .sdp_profile = SDP_PROFILE_WHIP, 
       .skip_stun_check_keepalive = 1, //是否跳过stun check 链接校验; ice-lite模式,通常需要设置为1;
+      .local_audio_ssrc = audio_ssrc,
+      .local_video_ssrc = video_ssrc,
   };
 
   g_pc = peer_connection_create(&config);

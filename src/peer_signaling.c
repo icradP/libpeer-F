@@ -1,7 +1,6 @@
 #ifndef DISABLE_PEER_SIGNALING
 #include <assert.h>
 #include <cJSON.h>
-#include <signal.h>
 #include <string.h>
 #include <unistd.h>
 
@@ -54,8 +53,12 @@ typedef struct PeerSignaling {
 
   int proto;  // 0: MQTT, 1: HTTP
   int port;
+  int session_port;
+  int http_post_ret;
   char host[HOST_MAX_LEN];
   char path[PATH_MAX_LEN];
+  char session_host[HOST_MAX_LEN];
+  char session_path[PATH_MAX_LEN];
   char token[TOKEN_MAX_LEN];
   char client_id[32];
 
@@ -133,6 +136,30 @@ static int peer_signaling_resolve_url(const char* url, char* host, int* port, ch
 
   LOGI("Host: %s, Port: %d, Path: %s", host, *port, path);
   return proto;
+}
+
+static int peer_signaling_url_has_explicit_port(const char* url) {
+  const char *host_start, *path_start, *port_start;
+
+  if (url == NULL) {
+    return 0;
+  }
+
+  if (strncmp(url, "mqtts://", 8) == 0) {
+    host_start = url + 8;
+  } else if (strncmp(url, "https://", 8) == 0) {
+    host_start = url + 8;
+  } else if (strncmp(url, "mqtt://", 7) == 0) {
+    host_start = url + 7;
+  } else if (strncmp(url, "http://", 7) == 0) {
+    host_start = url + 7;
+  } else {
+    return 0;
+  }
+
+  path_start = strchr(host_start, '/');
+  port_start = strchr(host_start, ':');
+  return port_start != NULL && (path_start == NULL || port_start < path_start);
 }
 
 static void peer_signaling_mqtt_publish(MQTTContext_t* mqtt_ctx, const char* message) {
@@ -280,8 +307,10 @@ HTTPResponse_t peer_signaling_http_request(const TransportInterface_t* transport
   status = HTTPClient_InitializeRequestHeaders(&request_headers, &request_info);
 
   if (status == HTTPSuccess) {
-    HTTPClient_AddHeader(&request_headers,
-                         "Content-Type", strlen("Content-Type"), "application/sdp", strlen("application/sdp"));
+    if (body && body_len > 0) {
+      HTTPClient_AddHeader(&request_headers,
+                           "Content-Type", strlen("Content-Type"), "application/sdp", strlen("application/sdp"));
+    }
 
     if (auth_len > 0) {
       HTTPClient_AddHeader(&request_headers,
@@ -290,15 +319,84 @@ HTTPResponse_t peer_signaling_http_request(const TransportInterface_t* transport
 
     response.pBuffer = g_ps.http_buf;
     response.bufferLen = sizeof(g_ps.http_buf);
+    response.getTime = ports_get_epoch_time;
 
     status = HTTPClient_Send(transport_interface,
                              &request_headers, (uint8_t*)body, body ? body_len : 0, &response, 0);
+    if (status != HTTPSuccess) {
+      LOGE("HTTPClient_Send failed: Error=%s.", HTTPClient_strerror(status));
+    }
 
   } else {
     LOGE("Failed to initialize HTTP request headers: Error=%s.", HTTPClient_strerror(status));
   }
 
   return response;
+}
+
+static void peer_signaling_save_session_location(HTTPResponse_t* res) {
+  const char* location = NULL;
+  size_t location_len = 0;
+  char session_url[URL_MAX_LEN] = {0};
+
+  if (HTTPClient_ReadHeader(res, "Location", strlen("Location"), &location, &location_len) != HTTPSuccess) {
+    return;
+  }
+
+  if (location_len == 0 || location_len >= sizeof(session_url)) {
+    LOGW("Invalid WHIP/WHEP session Location length: %zu", location_len);
+    return;
+  }
+
+  memcpy(session_url, location, location_len);
+
+  memset(g_ps.session_host, 0, sizeof(g_ps.session_host));
+  memset(g_ps.session_path, 0, sizeof(g_ps.session_path));
+  g_ps.session_port = 0;
+
+  if (strncmp(session_url, "http://", 7) == 0 || strncmp(session_url, "https://", 8) == 0) {
+    if (peer_signaling_resolve_url(session_url, g_ps.session_host, &g_ps.session_port, g_ps.session_path) < 0) {
+      memset(g_ps.session_host, 0, sizeof(g_ps.session_host));
+      memset(g_ps.session_path, 0, sizeof(g_ps.session_path));
+      g_ps.session_port = 0;
+    } else if (!peer_signaling_url_has_explicit_port(session_url) &&
+               strcmp(g_ps.session_host, g_ps.host) == 0) {
+      g_ps.session_port = g_ps.port;
+    }
+  } else if (session_url[0] == '/') {
+    strncpy(g_ps.session_host, g_ps.host, sizeof(g_ps.session_host) - 1);
+    strncpy(g_ps.session_path, session_url, sizeof(g_ps.session_path) - 1);
+    g_ps.session_port = g_ps.port;
+  } else {
+    LOGW("Unsupported WHIP/WHEP session Location: %s", session_url);
+  }
+}
+
+static int peer_signaling_http_delete(const char* hostname, const char* path, int port, const char* auth) {
+  int ret = 0;
+  TransportInterface_t trans_if = {0};
+  NetworkContext_t net_ctx;
+  HTTPResponse_t res;
+
+  trans_if.recv = ssl_transport_recv;
+  trans_if.send = ssl_transport_send;
+  trans_if.pNetworkContext = &net_ctx;
+
+  assert(port > 0);
+
+  ret = ssl_transport_connect(&net_ctx, hostname, port, NULL);
+  if (ret < 0) {
+    LOGE("Failed to connect to %s:%d", hostname, port);
+    return ret;
+  }
+
+  res = peer_signaling_http_request(&trans_if, "DELETE", 6, hostname, strlen(hostname), path,
+                                    strlen(path), auth, strlen(auth), NULL, 0);
+
+  ssl_transport_disconnect(&net_ctx);
+
+  LOGI("WHIP/WHEP DELETE %s%s response status: %u", hostname, path, res.statusCode);
+  return (res.statusCode >= 200 && res.statusCode < 300) ? 0 : -1;
 }
 
 static int peer_signaling_http_post(const char* hostname, const char* path, int port, const char* auth, const char* body) {
@@ -340,6 +438,10 @@ static int peer_signaling_http_post(const char* hostname, const char* path, int 
       "Response Headers: %s\nResponse Status: %u\nResponse Body: %s\n",
       hostname, path, res.pHeaders, res.statusCode, res.pBody);
 
+  if (res.statusCode == 200 || res.statusCode == 201) {
+    peer_signaling_save_session_location(&res);
+  }
+
   if (res.statusCode == 200) {
     // JSON response - extract SDP from JSON
     cJSON* json = cJSON_Parse((const char*)res.pBody);
@@ -348,18 +450,36 @@ static int peer_signaling_http_post(const char* hostname, const char* path, int 
       if (sdp && cJSON_IsString(sdp)) {
         LOGI("Extracted SDP from JSON response");
         peer_connection_set_remote_description(g_ps.pc, sdp->valuestring, SDP_TYPE_ANSWER);
+        ret = 0;
       } else {
-        LOGE("Failed to extract SDP from JSON response");
+        cJSON* code = cJSON_GetObjectItem(json, "code");
+        cJSON* msg = cJSON_GetObjectItem(json, "msg");
+        if (code || msg) {
+          LOGE("HTTP signaling error: code=%d, msg=%s",
+               cJSON_IsNumber(code) ? code->valueint : 0,
+               cJSON_IsString(msg) ? msg->valuestring : "");
+        } else {
+          LOGE("Failed to extract SDP from JSON response");
+        }
+        ret = -1;
       }
       cJSON_Delete(json);
     } else {
       LOGE("Failed to parse JSON response");
+      ret = -1;
     }
   } else if (res.statusCode == 201) {
     // SDP response - use body directly
     peer_connection_set_remote_description(g_ps.pc, (const char*)res.pBody, SDP_TYPE_ANSWER);
+    ret = 0;
+  } else if (res.statusCode == 406) {
+    LOGE("HTTP signaling rejected offer: status=406, body=%s", res.pBody);
+    ret = -1;
+  } else {
+    LOGE("Unexpected HTTP signaling status: %u", res.statusCode);
+    ret = -1;
   }
-  return 0;
+  return ret;
 }
 
 static void peer_signaling_mqtt_event_cb(MQTTContext_t* mqtt_ctx,
@@ -369,7 +489,7 @@ static void peer_signaling_mqtt_event_cb(MQTTContext_t* mqtt_ctx,
   switch (packet_info->type) {
     case MQTT_PACKET_TYPE_PUBLISH:
       LOGD("MQTT received message: %.*s",
-           deserialized_info->pPublishInfo->payloadLength,
+           (int)deserialized_info->pPublishInfo->payloadLength,
            (char*)deserialized_info->pPublishInfo->pPayload);
       peer_signaling_on_pub_event(deserialized_info->pPublishInfo->pPayload,
                                   deserialized_info->pPublishInfo->payloadLength);
@@ -506,15 +626,20 @@ static void peer_signaling_onicecandidate(char* description, void* userdata) {
       char cred[TOKEN_MAX_LEN + 10];
       memset(cred, 0, sizeof(cred));
       snprintf(cred, sizeof(cred), "Bearer %s", g_ps.token);
-      peer_signaling_http_post(g_ps.host, g_ps.path, g_ps.port, cred, description);
+      g_ps.http_post_ret = peer_signaling_http_post(g_ps.host, g_ps.path, g_ps.port, cred, description);
     } else {
-      peer_signaling_http_post(g_ps.host, g_ps.path, g_ps.port, "", description);
+      g_ps.http_post_ret = peer_signaling_http_post(g_ps.host, g_ps.path, g_ps.port, "", description);
     }
   }
 }
 
 int peer_signaling_connect(const char* url, const char* token, PeerConnection* pc) {
   char* client_id;
+
+  memset(g_ps.session_host, 0, sizeof(g_ps.session_host));
+  memset(g_ps.session_path, 0, sizeof(g_ps.session_path));
+  g_ps.session_port = 0;
+  g_ps.http_post_ret = 0;
 
   if ((g_ps.proto = peer_signaling_resolve_url(url, g_ps.host, &g_ps.port, g_ps.path)) < 0) {
     LOGE("Resolve URL failed");
@@ -539,6 +664,7 @@ int peer_signaling_connect(const char* url, const char* token, PeerConnection* p
     } break;
     case 1: {  // HTTP
       peer_connection_create_offer(g_ps.pc);
+      return g_ps.http_post_ret;
     } break;
     default: {
     } break;
@@ -549,6 +675,25 @@ int peer_signaling_connect(const char* url, const char* token, PeerConnection* p
 
 void peer_signaling_disconnect() {
   MQTTStatus_t status = MQTTSuccess;
+
+  if (g_ps.pc) {
+    peer_connection_close(g_ps.pc);
+  }
+
+  if (g_ps.proto == 1 && g_ps.session_path[0] != '\0') {
+    if (strlen(g_ps.token) > 0) {
+      char cred[TOKEN_MAX_LEN + 10];
+      memset(cred, 0, sizeof(cred));
+      snprintf(cred, sizeof(cred), "Bearer %s", g_ps.token);
+      peer_signaling_http_delete(g_ps.session_host, g_ps.session_path, g_ps.session_port, cred);
+    } else {
+      peer_signaling_http_delete(g_ps.session_host, g_ps.session_path, g_ps.session_port, "");
+    }
+
+    memset(g_ps.session_host, 0, sizeof(g_ps.session_host));
+    memset(g_ps.session_path, 0, sizeof(g_ps.session_path));
+    g_ps.session_port = 0;
+  }
 
   if (!g_ps.proto && !peer_signaling_mqtt_subscribe(0)) {
     status = MQTT_Disconnect(&g_ps.mqtt_ctx);

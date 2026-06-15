@@ -2,9 +2,7 @@
 #include <string.h>
 #include <sys/time.h>
 
-#include "address.h"
 #include "rtcp.h"
-#include "rtp.h"
 
 #define NTP_UNIX_EPOCH_OFFSET 2208988800ULL
 
@@ -58,6 +56,40 @@ int rtcp_build_sr(uint8_t* packet, int len, uint32_t ssrc, uint32_t rtp_timestam
   rtcp_write_u32_be(packet, 24, octet_count);
 
   return 28;
+}
+
+int rtcp_build_rr(uint8_t* packet, int len, uint32_t receiver_ssrc, uint32_t media_ssrc) {
+  if (packet == NULL || len < 32 || media_ssrc == 0)
+    return -1;
+
+  // TODO: Fill RR report block statistics for WHEP QoS feedback:
+  // fraction lost, cumulative lost, extended highest sequence, jitter,
+  // LSR, and DLSR. This minimal RR is currently used as RTCP keepalive.
+  memset(packet, 0, len);
+  packet[0] = 0x81;  // V=2, RC=1
+  packet[1] = RTCP_RR;
+  packet[2] = 0;
+  packet[3] = 7;     // 32 bytes / 4 - 1
+
+  rtcp_write_u32_be(packet, 4, receiver_ssrc);
+  rtcp_write_u32_be(packet, 8, media_ssrc);
+
+  return 32;
+}
+
+int rtcp_build_bye(uint8_t* packet, int len, uint32_t ssrc) {
+  if (packet == NULL || len < 8 || ssrc == 0)
+    return -1;
+
+  memset(packet, 0, len);
+  packet[0] = 0x81;  // V=2, SC=1
+  packet[1] = RTCP_BYE;
+  packet[2] = 0;
+  packet[3] = 1;     // 8 bytes / 4 - 1
+
+  rtcp_write_u32_be(packet, 4, ssrc);
+
+  return 8;
 }
 
 int rtcp_get_pli(uint8_t* packet, int len, uint32_t ssrc) {

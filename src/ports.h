@@ -1,6 +1,7 @@
 #ifndef PORTS_H_
 #define PORTS_H_
 
+#include <stdint.h>
 #include <stdlib.h>
 #include "address.h"
 
@@ -11,6 +12,8 @@ int ports_resolve_mdns_host(const char* host, Address* addr);
 int ports_get_host_addr(Address* addr, const char* iface_prefix);
 
 uint32_t ports_get_epoch_time();
+
+uint32_t ports_random_u32();
 
 void ports_sleep_ms(int ms);
 
