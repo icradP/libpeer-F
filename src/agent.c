@@ -5,6 +5,7 @@
 #include <unistd.h>
 
 #include "agent.h"
+#include "address.h"
 #include "base64.h"
 #include "ice.h"
 #include "ports.h"
@@ -300,7 +301,18 @@ void agent_get_local_description(Agent* agent, char* description, int length) {
 }
 
 int agent_send(Agent* agent, const uint8_t* buf, int len) {
-  return agent_socket_send(agent, &agent->nominated_pair->remote->addr, buf, len);
+  IceCandidatePair* pair = agent->nominated_pair;
+
+  if (pair == NULL || pair->remote == NULL) {
+    pair = agent->selected_pair;
+  }
+
+  if (pair == NULL || pair->remote == NULL) {
+    LOGE("agent_send: no selected ICE pair");
+    return -1;
+  }
+
+  return agent_socket_send(agent, &pair->remote->addr, buf, len);
 }
 
 static void agent_create_binding_response(Agent* agent, StunMessage* msg, Address* addr) {
@@ -376,10 +388,9 @@ int agent_recv_datagram(Agent* agent, uint8_t* buf, int len) {
 
 void agent_drain_pending(Agent* agent) {
   uint8_t buf[1400];
-  Address addr;
 
   for (int i = 0; i < 32; i++) {
-    if (agent_socket_recv(agent, &addr, buf, sizeof(buf)) <= 0) {
+    if (agent_recv(agent, buf, sizeof(buf)) != 0) {
       break;
     }
   }
@@ -452,7 +463,22 @@ void agent_set_remote_description(Agent* agent, char* description) {
 
 void agent_update_candidate_pairs(Agent* agent) {
   int i, j;
-  // Please set gather candidates before set remote description
+  Address saved_remote = {0};
+  Address saved_local = {0};
+  int save_selection = 0;
+
+  if (agent->selected_pair != NULL && agent->selected_pair->remote != NULL) {
+    saved_remote = agent->selected_pair->remote->addr;
+    if (agent->selected_pair->local != NULL) {
+      saved_local = agent->selected_pair->local->addr;
+    }
+    save_selection = 1;
+  }
+
+  agent->candidate_pairs_num = 0;
+  agent->nominated_pair = NULL;
+  agent->selected_pair = NULL;
+
   for (i = 0; i < agent->local_candidates_count; i++) {
     for (j = 0; j < agent->remote_candidates_count; j++) {
       if (agent->local_candidates[i].addr.family == agent->remote_candidates[j].addr.family) {
@@ -465,6 +491,30 @@ void agent_update_candidate_pairs(Agent* agent) {
     }
   }
   LOGD("candidate pairs num: %d", agent->candidate_pairs_num);
+
+  if (!save_selection) {
+    return;
+  }
+
+  for (i = 0; i < agent->candidate_pairs_num; i++) {
+    IceCandidatePair* pair = &agent->candidate_pairs[i];
+
+    if (pair->remote == NULL || !addr_equal(&pair->remote->addr, &saved_remote)) {
+      continue;
+    }
+
+    if (pair->local != NULL && saved_local.family != 0 && !addr_equal(&pair->local->addr, &saved_local)) {
+      continue;
+    }
+
+    pair->state = ICE_CANDIDATE_STATE_SUCCEEDED;
+    agent->selected_pair = pair;
+    agent->nominated_pair = pair;
+    LOGI("Restored ICE selected pair after candidate update");
+    return;
+  }
+
+  LOGW("ICE selected pair lost after candidate update");
 }
 
 int agent_connectivity_check(Agent* agent) {

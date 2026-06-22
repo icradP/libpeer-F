@@ -191,7 +191,7 @@ int main(int argc, char* argv[]) {
   // 创建 PeerConnection — 仅启用用户指定的媒体轨
   PeerConfiguration config = {
       .ice_servers = {
-          {.urls = "stun:stun.l.google.com:19302"},
+          {.urls = "stun:www.icrad.ltd:3478"},
       },
       .datachannel = DATA_CHANNEL_NONE,
       .video_codec = enable_video ? CODEC_H264 : CODEC_NONE,

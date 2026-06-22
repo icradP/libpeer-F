@@ -79,6 +79,9 @@ int dtls_srtp_create_cert(DtlsSrtp* dtls_srtp);
 
 int dtls_srtp_handshake(DtlsSrtp* dtls_srtp, Address* addr);
 
+/* One mbedtls_ssl_handshake step; returns 0 when done, WANT_READ/WRITE while progressing. */
+int dtls_srtp_handshake_step(DtlsSrtp* dtls_srtp, Address* addr);
+
 void dtls_srtp_reset_session(DtlsSrtp* dtls_srtp);
 
 void dtls_srtp_reconfig(DtlsSrtp* dtls_srtp, DtlsSrtpRole role);

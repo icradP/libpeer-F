@@ -103,7 +103,7 @@ int ice_candidate_from_description(IceCandidate* candidate, char* description, c
   }
 
   if (strncmp(candidate->transport, "UDP", 3) != 0 && strncmp(candidate->transport, "udp", 3) != 0) {
-    LOGE("Only UDP transport is supported");
+    LOGW("Skip non-UDP ICE candidate transport: %s", candidate->transport);
     return -1;
   }
 

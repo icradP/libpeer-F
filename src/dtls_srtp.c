@@ -183,7 +183,7 @@ int dtls_srtp_init(DtlsSrtp* dtls_srtp, DtlsSrtpRole role, void* user_data) {
 
   mbedtls_ssl_conf_rng(&dtls_srtp->conf, mbedtls_ctr_drbg_random, &dtls_srtp->ctr_drbg);
 
-  mbedtls_ssl_conf_read_timeout(&dtls_srtp->conf, 1000);
+  mbedtls_ssl_conf_read_timeout(&dtls_srtp->conf, 200);
 
   if (dtls_srtp->role == DTLS_SRTP_ROLE_SERVER) {
     mbedtls_ssl_config_defaults(&dtls_srtp->conf,
@@ -413,69 +413,100 @@ static int dtls_srtp_do_handshake(DtlsSrtp* dtls_srtp) {
   return mbedtls_ssl_handshake(&dtls_srtp->ssl);
 }
 
-static int dtls_srtp_handshake_server(DtlsSrtp* dtls_srtp) {
-  int ret;
-  int attempts = 0;
-  int reset_session = 1;
-
-  while (attempts < 100) {
-    unsigned char client_ip[16];
-    int client_ip_len = 0;
-
-    if (dtls_srtp->remote_addr) {
-      if (dtls_srtp->remote_addr->family == AF_INET6) {
-        memcpy(client_ip, &dtls_srtp->remote_addr->sin6.sin6_addr, 16);
-        client_ip_len = 16;
-      } else {
-        memcpy(client_ip, &dtls_srtp->remote_addr->sin.sin_addr, 4);
-        client_ip_len = 4;
-      }
-    } else {
-      memcpy(client_ip, "test", 4);
-      client_ip_len = 4;
-    }
-
-    if (reset_session) {
-      mbedtls_ssl_session_reset(&dtls_srtp->ssl);
-
-      mbedtls_ssl_set_client_transport_id(&dtls_srtp->ssl, client_ip, client_ip_len);
-      reset_session = 0;
-    }
-
-    ret = dtls_srtp_do_handshake(dtls_srtp);
-
-    if (ret == MBEDTLS_ERR_SSL_HELLO_VERIFY_REQUIRED) {
-      LOGD("DTLS hello verification requested");
-      reset_session = 1;
-
-    } else if (ret == MBEDTLS_ERR_SSL_WANT_READ || ret == MBEDTLS_ERR_SSL_WANT_WRITE) {
-      attempts++;
-      ports_sleep_ms(50);
-      continue;
-
-    } else if (ret != 0) {
-      LOGE("failed! mbedtls_ssl_handshake returned -0x%.4x", (unsigned int)-ret);
-
-      break;
-
-    } else {
-      break;
-    }
+static int dtls_srtp_verify_peer_fingerprint(DtlsSrtp* dtls_srtp) {
+  if (dtls_srtp->remote_fingerprint[0] == '\0') {
+    LOGE("no remote fingerprint in SDP");
+    return -1;
   }
 
-  LOGD("DTLS server handshake done");
+  const mbedtls_x509_crt* remote_crt = mbedtls_ssl_get_peer_cert(&dtls_srtp->ssl);
+  if (remote_crt == NULL) {
+    LOGE("no remote fingerprint");
+    return -1;
+  }
 
-  return ret;
+  dtls_srtp_x509_digest(remote_crt, dtls_srtp->actual_remote_fingerprint);
+
+  if (strncmp(dtls_srtp->remote_fingerprint, dtls_srtp->actual_remote_fingerprint, DTLS_SRTP_FINGERPRINT_LENGTH) != 0) {
+    LOGE("Actual and Expected Fingerprint mismatch: %s %s",
+         dtls_srtp->remote_fingerprint,
+         dtls_srtp->actual_remote_fingerprint);
+    return -1;
+  }
+
+  mbedtls_dtls_srtp_info dtls_srtp_negotiation_result;
+  mbedtls_ssl_get_dtls_srtp_negotiation_result(&dtls_srtp->ssl, &dtls_srtp_negotiation_result);
+  return 0;
 }
 
-static int dtls_srtp_handshake_client(DtlsSrtp* dtls_srtp) {
-  int ret = MBEDTLS_ERR_SSL_WANT_READ;
+int dtls_srtp_handshake_step(DtlsSrtp* dtls_srtp, Address* addr) {
+  int ret;
+
+  if (addr != NULL) {
+    dtls_srtp->remote_addr = addr;
+  }
+
+  if (dtls_srtp->state == DTLS_SRTP_STATE_INIT) {
+    if (dtls_srtp->role == DTLS_SRTP_ROLE_SERVER) {
+      unsigned char client_ip[16];
+      int client_ip_len = 0;
+
+      if (dtls_srtp->remote_addr) {
+        if (dtls_srtp->remote_addr->family == AF_INET6) {
+          memcpy(client_ip, &dtls_srtp->remote_addr->sin6.sin6_addr, 16);
+          client_ip_len = 16;
+        } else {
+          memcpy(client_ip, &dtls_srtp->remote_addr->sin.sin_addr, 4);
+          client_ip_len = 4;
+        }
+      } else {
+        memcpy(client_ip, "test", 4);
+        client_ip_len = 4;
+      }
+
+      mbedtls_ssl_session_reset(&dtls_srtp->ssl);
+      mbedtls_ssl_set_client_transport_id(&dtls_srtp->ssl, client_ip, client_ip_len);
+    }
+
+    dtls_srtp->state = DTLS_SRTP_STATE_HANDSHAKE;
+  }
+
+  ret = dtls_srtp_do_handshake(dtls_srtp);
+
+  if (ret == MBEDTLS_ERR_SSL_HELLO_VERIFY_REQUIRED && dtls_srtp->role == DTLS_SRTP_ROLE_SERVER) {
+    dtls_srtp->state = DTLS_SRTP_STATE_INIT;
+    return MBEDTLS_ERR_SSL_WANT_READ;
+  }
+
+  if (ret == MBEDTLS_ERR_SSL_WANT_READ || ret == MBEDTLS_ERR_SSL_WANT_WRITE) {
+    return ret;
+  }
+
+  if (ret != 0) {
+    LOGE("failed! mbedtls_ssl_handshake returned -0x%.4x", (unsigned int)-ret);
+    dtls_srtp_reset_session(dtls_srtp);
+    return ret;
+  }
+
+  if (dtls_srtp_verify_peer_fingerprint(dtls_srtp) != 0) {
+    dtls_srtp_reset_session(dtls_srtp);
+    return -1;
+  }
+
+  dtls_srtp->state = DTLS_SRTP_STATE_CONNECTED;
+  return 0;
+}
+
+int dtls_srtp_handshake(DtlsSrtp* dtls_srtp, Address* addr) {
+  int ret;
   int attempts = 0;
 
+  dtls_srtp->remote_addr = addr;
+
   while (attempts < 100) {
-    ret = dtls_srtp_do_handshake(dtls_srtp);
+    ret = dtls_srtp_handshake_step(dtls_srtp, addr);
     if (ret == 0) {
-      break;
+      return 0;
     }
 
     if (ret == MBEDTLS_ERR_SSL_WANT_READ || ret == MBEDTLS_ERR_SSL_WANT_WRITE) {
@@ -484,64 +515,20 @@ static int dtls_srtp_handshake_client(DtlsSrtp* dtls_srtp) {
       continue;
     }
 
-    LOGE("failed! mbedtls_ssl_handshake returned -0x%.4x\n\n", (unsigned int)-ret);
-    break;
-  }
-
-  LOGD("DTLS client handshake done");
-
-  return ret;
-}
-
-int dtls_srtp_handshake(DtlsSrtp* dtls_srtp, Address* addr) {
-  int ret;
-  dtls_srtp->remote_addr = addr;
-
-  if (dtls_srtp->role == DTLS_SRTP_ROLE_SERVER) {
-    ret = dtls_srtp_handshake_server(dtls_srtp);
-  } else {
-    ret = dtls_srtp_handshake_client(dtls_srtp);
-  }
-
-  if (ret != 0) {
-    dtls_srtp_reset_session(dtls_srtp);
     return ret;
   }
 
-  if (dtls_srtp->remote_fingerprint[0] == '\0') {
-    LOGE("no remote fingerprint in SDP");
-    dtls_srtp_reset_session(dtls_srtp);
-    return -1;
-  }
-
-  const mbedtls_x509_crt* remote_crt;
-  if ((remote_crt = mbedtls_ssl_get_peer_cert(&dtls_srtp->ssl)) != NULL) {
-    dtls_srtp_x509_digest(remote_crt, dtls_srtp->actual_remote_fingerprint);
-
-    if (strncmp(dtls_srtp->remote_fingerprint, dtls_srtp->actual_remote_fingerprint, DTLS_SRTP_FINGERPRINT_LENGTH) != 0) {
-      LOGE("Actual and Expected Fingerprint mismatch: %s %s",
-           dtls_srtp->remote_fingerprint,
-           dtls_srtp->actual_remote_fingerprint);
-      dtls_srtp_reset_session(dtls_srtp);
-      return -1;
-    }
-
-  } else {
-    LOGE("no remote fingerprint");
-    dtls_srtp_reset_session(dtls_srtp);
-    return -1;
-  }
-
-  mbedtls_dtls_srtp_info dtls_srtp_negotiation_result;
-  mbedtls_ssl_get_dtls_srtp_negotiation_result(&dtls_srtp->ssl, &dtls_srtp_negotiation_result);
-
-  return 0;
+  dtls_srtp_reset_session(dtls_srtp);
+  return ret;
 }
 
 void dtls_srtp_reset_session(DtlsSrtp* dtls_srtp) {
   if (dtls_srtp->state == DTLS_SRTP_STATE_CONNECTED) {
     srtp_dealloc(dtls_srtp->srtp_in);
     srtp_dealloc(dtls_srtp->srtp_out);
+  }
+
+  if (dtls_srtp->state != DTLS_SRTP_STATE_INIT) {
     mbedtls_ssl_session_reset(&dtls_srtp->ssl);
   }
 
@@ -580,7 +567,7 @@ void dtls_srtp_reconfig(DtlsSrtp* dtls_srtp, DtlsSrtpRole role) {
   mbedtls_ssl_conf_ca_chain(&dtls_srtp->conf, &dtls_srtp->cert, NULL);
   mbedtls_ssl_conf_own_cert(&dtls_srtp->conf, &dtls_srtp->cert, &dtls_srtp->pkey);
   mbedtls_ssl_conf_rng(&dtls_srtp->conf, mbedtls_ctr_drbg_random, &dtls_srtp->ctr_drbg);
-  mbedtls_ssl_conf_read_timeout(&dtls_srtp->conf, 1000);
+  mbedtls_ssl_conf_read_timeout(&dtls_srtp->conf, 200);
 
   if (role == DTLS_SRTP_ROLE_SERVER) {
     mbedtls_ssl_config_defaults(&dtls_srtp->conf,

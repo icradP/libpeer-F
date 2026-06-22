@@ -22,10 +22,19 @@
 #endif
 
 #define STATE_CHANGED(pc, curr_state)                                 \
-  if (pc->oniceconnectionstatechange && pc->state != curr_state) {    \
-    pc->oniceconnectionstatechange(curr_state, pc->config.user_data); \
+  {                                                                   \
+    if (pc->oniceconnectionstatechange && pc->state != curr_state) {  \
+      pc->oniceconnectionstatechange(curr_state, pc->config.user_data); \
+    }                                                                 \
     pc->state = curr_state;                                           \
   }
+
+typedef enum RemoteDtlsSetup {
+  REMOTE_DTLS_SETUP_UNKNOWN = 0,
+  REMOTE_DTLS_SETUP_ACTPASS,
+  REMOTE_DTLS_SETUP_ACTIVE,
+  REMOTE_DTLS_SETUP_PASSIVE,
+} RemoteDtlsSetup;
 
 struct PeerConnection {
   PeerConfiguration config;
@@ -64,6 +73,8 @@ struct PeerConnection {
   uint32_t last_rtcp_rr_ms;
   int dtls_handshake_started;
   int rtcp_bye_sent;
+  int dtls_hs_want_count;
+  RemoteDtlsSetup remote_dtls_setup;
 };
 
 static void peer_connection_outgoing_rtcp_packet(PeerConnection* pc, uint8_t* data, size_t size) {
@@ -178,11 +189,17 @@ static int peer_connection_dtls_srtp_recv(void* ctx, unsigned char* buf, size_t 
     return ret;
   }
 
-  while (recv_max < CONFIG_TLS_READ_TIMEOUT && pc->state == PEER_CONNECTION_CONNECTED) {
-    ret = agent_recv_datagram(&pc->agent, buf, len);
+  while (recv_max < DTLS_UDP_RECV_MAX_TRIES && pc->state == PEER_CONNECTION_CONNECTED) {
+    ret = agent_recv(&pc->agent, (uint8_t*)buf, len);
+
+    if (ret == 0) {
+      /* STUN handled; keep polling without counting toward idle timeout. */
+      continue;
+    }
 
     if (ret > 0) {
       if (peer_connection_datagram_is_dtls((const uint8_t*)buf, ret)) {
+        LOGD("DTLS RX: len=%d content_type=%u", ret, buf[0]);
         return ret;
       }
       continue;
@@ -197,7 +214,10 @@ static int peer_connection_dtls_srtp_send(void* ctx, const uint8_t* buf, size_t 
   DtlsSrtp* dtls_srtp = (DtlsSrtp*)ctx;
   PeerConnection* pc = (PeerConnection*)dtls_srtp->user_data;
 
-  // LOGD("send %.4x %.4x, %ld", *(uint16_t*)buf, *(uint16_t*)(buf + 2), len);
+  if (pc->state == PEER_CONNECTION_CONNECTED && len > 0 && pc->dtls_hs_want_count <= 1) {
+    LOGI("DTLS TX: len=%zu content_type=%u", len, buf[0]);
+  }
+
   return agent_send(&pc->agent, buf, len);
 }
 
@@ -535,6 +555,20 @@ int peer_connection_create_datachannel_sid(PeerConnection* pc, DecpChannelType c
   return rtrn;
 }
 
+static DtlsSrtpRole peer_connection_answer_dtls_role(PeerConnection* pc) {
+  switch (pc->remote_dtls_setup) {
+    case REMOTE_DTLS_SETUP_ACTIVE:
+      /* Remote offer setup:active -> remote initiates DTLS; we answer passive. */
+      return DTLS_SRTP_ROLE_SERVER;
+    case REMOTE_DTLS_SETUP_PASSIVE:
+      /* Remote offer setup:passive -> we must initiate DTLS. */
+      return DTLS_SRTP_ROLE_CLIENT;
+    case REMOTE_DTLS_SETUP_ACTPASS:
+    default:
+      return DTLS_SRTP_ROLE_CLIENT;
+  }
+}
+
 static const char* peer_connection_dtls_role_setup_value(SdpType sdp_type, DtlsSrtpRole d) {
   if (sdp_type == SDP_TYPE_OFFER) {
     return "a=setup:actpass";
@@ -552,6 +586,10 @@ int peer_connection_loop(PeerConnection* pc) {
       break;
 
     case PEER_CONNECTION_CHECKING:
+      if (pc->agent.candidate_pairs_num == 0) {
+        /* Trickle ICE: remote candidates may arrive after local answer/offer. */
+        break;
+      }
       if (pc->config.skip_stun_check_keepalive) {
         if (agent_skip_connectivity_check(&pc->agent) == 0) {
           STATE_CHANGED(pc, PEER_CONNECTION_CONNECTED);
@@ -567,21 +605,31 @@ int peer_connection_loop(PeerConnection* pc) {
 
     case PEER_CONNECTION_CONNECTED: {
       Address* remote_addr = NULL;
+      int hs_ret;
+
       if (pc->agent.selected_pair && pc->agent.selected_pair->remote) {
         remote_addr = &pc->agent.selected_pair->remote->addr;
       }
+
       pc->dtls_srtp.udp_send = peer_connection_dtls_srtp_send;
       pc->dtls_srtp.udp_recv = peer_connection_dtls_srtp_recv;
 
-      if (pc->dtls_handshake_started) {
-        break;
-      }
-      pc->dtls_handshake_started = 1;
-
+      /* Drain a few pending STUN packets; do not loop forever on keepalives. */
       agent_drain_pending(&pc->agent);
 
-      if (dtls_srtp_handshake(&pc->dtls_srtp, remote_addr) == 0) {
-        LOGD("DTLS-SRTP handshake done");
+      for (int burst = 0; burst < 16; burst++) {
+        hs_ret = dtls_srtp_handshake_step(&pc->dtls_srtp, remote_addr);
+        if (hs_ret == 0) {
+          break;
+        }
+        if (hs_ret != MBEDTLS_ERR_SSL_WANT_READ && hs_ret != MBEDTLS_ERR_SSL_WANT_WRITE) {
+          break;
+        }
+      }
+
+      if (hs_ret == 0) {
+        pc->dtls_hs_want_count = 0;
+        LOGI("DTLS-SRTP handshake done");
 
         if (pc->config.datachannel) {
           LOGI("SCTP create socket");
@@ -590,11 +638,26 @@ int peer_connection_loop(PeerConnection* pc) {
         }
 
         STATE_CHANGED(pc, PEER_CONNECTION_COMPLETED);
+      } else if (hs_ret == MBEDTLS_ERR_SSL_WANT_READ || hs_ret == MBEDTLS_ERR_SSL_WANT_WRITE) {
+        pc->dtls_hs_want_count++;
+        if (pc->dtls_hs_want_count == 1) {
+          LOGI("DTLS handshake in progress (role=%s)",
+               pc->dtls_srtp.role == DTLS_SRTP_ROLE_SERVER ? "server/passive" : "client/active");
+        } else if (pc->dtls_hs_want_count % 200 == 0) {
+          LOGW("DTLS handshake still waiting (want=%d, count=%d)",
+               hs_ret, pc->dtls_hs_want_count);
+        }
+        if (pc->dtls_hs_want_count > 500) {
+          LOGE("DTLS handshake timeout after ICE connected");
+          dtls_srtp_reset_session(&pc->dtls_srtp);
+          STATE_CHANGED(pc, PEER_CONNECTION_FAILED);
+        }
       } else {
+        pc->dtls_hs_want_count = 0;
         dtls_srtp_reset_session(&pc->dtls_srtp);
         STATE_CHANGED(pc, PEER_CONNECTION_FAILED);
       }
-      } break;
+    } break;
     case PEER_CONNECTION_COMPLETED:
       peer_connection_maybe_send_rtcp_rr(pc);
 
@@ -735,14 +798,24 @@ void peer_connection_set_remote_description(PeerConnection* pc, const char* sdp,
     strncpy(buf, start, line - start);
     buf[line - start] = '\0';
 
-    if (strstr(buf, "a=setup:active")) {
-      // remote will initiate DTLS -> we are server (passive)
+    if (strstr(buf, "a=setup:actpass")) {
       role = DTLS_SRTP_ROLE_SERVER;
       has_setup = 1;
+      if (type == SDP_TYPE_OFFER) {
+        pc->remote_dtls_setup = REMOTE_DTLS_SETUP_ACTPASS;
+      }
     } else if (strstr(buf, "a=setup:passive")) {
-      // remote waits -> we are client (active, must initiate)
       role = DTLS_SRTP_ROLE_CLIENT;
       has_setup = 1;
+      if (type == SDP_TYPE_OFFER) {
+        pc->remote_dtls_setup = REMOTE_DTLS_SETUP_PASSIVE;
+      }
+    } else if (strstr(buf, "a=setup:active")) {
+      role = DTLS_SRTP_ROLE_SERVER;
+      has_setup = 1;
+      if (type == SDP_TYPE_OFFER) {
+        pc->remote_dtls_setup = REMOTE_DTLS_SETUP_ACTIVE;
+      }
     }
 
     if (strstr(buf, "a=fingerprint")) {
@@ -811,16 +884,23 @@ static const char* peer_connection_create_sdp(PeerConnection* pc, SdpType sdp_ty
   DtlsSrtpRole role = DTLS_SRTP_ROLE_SERVER;
 
   pc->sctp.connected = 0;
+  pc->dtls_hs_want_count = 0;
 
   switch (sdp_type) {
     case SDP_TYPE_OFFER:
       role = DTLS_SRTP_ROLE_SERVER;
       agent_clear_candidates(&pc->agent);
       pc->agent.mode = AGENT_MODE_CONTROLLING;
+      pc->remote_dtls_setup = REMOTE_DTLS_SETUP_UNKNOWN;
       break;
     case SDP_TYPE_ANSWER:
-      role = DTLS_SRTP_ROLE_CLIENT;
+      role = peer_connection_answer_dtls_role(pc);
       pc->agent.mode = AGENT_MODE_CONTROLLED;
+      LOGI("Answer DTLS role: %s (remote offer setup: %s)",
+           role == DTLS_SRTP_ROLE_SERVER ? "passive/server" : "active/client",
+           pc->remote_dtls_setup == REMOTE_DTLS_SETUP_ACTIVE ? "active" :
+           pc->remote_dtls_setup == REMOTE_DTLS_SETUP_PASSIVE ? "passive" :
+           pc->remote_dtls_setup == REMOTE_DTLS_SETUP_ACTPASS ? "actpass" : "unknown");
       break;
     default:
       break;
@@ -967,5 +1047,10 @@ int peer_connection_add_ice_candidate(PeerConnection* pc, char* candidate) {
   }
   LOGD("Add candidate: %s", candidate);
   agent->remote_candidates_count++;
+  agent_update_candidate_pairs(agent);
+
+  if (pc->state == PEER_CONNECTION_FAILED && agent->candidate_pairs_num > 0) {
+    STATE_CHANGED(pc, PEER_CONNECTION_CHECKING);
+  }
   return 0;
 }

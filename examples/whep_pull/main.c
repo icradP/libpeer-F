@@ -165,7 +165,7 @@ int main(int argc, char* argv[]) {
 
   PeerConfiguration config = {
       .ice_servers = {
-          {.urls = "stun:stun.l.google.com:19302"},
+          {.urls = "stun:www.icrad.ltd:3478"},
       },
       .datachannel = DATA_CHANNEL_NONE,
       .video_codec = enable_video ? CODEC_H264 : CODEC_NONE,
