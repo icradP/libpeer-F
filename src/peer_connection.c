@@ -21,6 +21,17 @@
 #define MBEDTLS_ERR_SSL_WANT_READ -0x6900
 #endif
 
+#ifndef MBEDTLS_ERR_SSL_INVALID_RECORD
+#define MBEDTLS_ERR_SSL_INVALID_RECORD -0x7200
+#endif
+
+#ifndef MBEDTLS_ERR_SSL_BAD_HS_PROTOCOL_VERSION
+#define MBEDTLS_ERR_SSL_BAD_HS_PROTOCOL_VERSION -0x7300
+#endif
+
+#define PEER_CONNECTION_DTLS_RX_SIZE 8192
+#define PEER_CONNECTION_DTLS_FLIGHT_MAX_IDLE 40
+
 #define STATE_CHANGED(pc, curr_state)                                 \
   {                                                                   \
     if (pc->oniceconnectionstatechange && pc->state != curr_state) {  \
@@ -75,6 +86,10 @@ struct PeerConnection {
   int rtcp_bye_sent;
   int dtls_hs_want_count;
   RemoteDtlsSetup remote_dtls_setup;
+  int talk_dtls_client_offer;
+  uint32_t last_dtls_hs_ms;
+  uint8_t dtls_rx_buf[PEER_CONNECTION_DTLS_RX_SIZE];
+  size_t dtls_rx_len;
 };
 
 static void peer_connection_outgoing_rtcp_packet(PeerConnection* pc, uint8_t* data, size_t size) {
@@ -176,38 +191,190 @@ static int peer_connection_datagram_is_dtls(const uint8_t* buf, size_t len) {
   return buf[0] >= 20 && buf[0] <= 63;
 }
 
+static void peer_connection_dtls_rx_clear(PeerConnection* pc) {
+  pc->dtls_rx_len = 0;
+}
+
+static int peer_connection_dtls_client_hello_complete(const uint8_t* buf, size_t len) {
+  size_t off = 0;
+  uint16_t hello_seq = 0;
+  uint32_t hello_total = 0;
+  uint32_t hello_end = 0;
+  int seen = 0;
+
+  while (off + 13 <= len) {
+    uint8_t ctype = buf[off];
+    uint16_t rec_len = ((uint16_t)buf[off + 11] << 8) | buf[off + 12];
+
+    if (off + 13 + rec_len > len) {
+      return 0;
+    }
+
+    if (ctype == 22 && rec_len >= 12) {
+      const uint8_t* hs = buf + off + 13;
+      if (hs[0] == 1) {
+        uint32_t hs_len = ((uint32_t)hs[1] << 16) | ((uint32_t)hs[2] << 8) | hs[3];
+        uint16_t seq = ((uint16_t)hs[4] << 8) | hs[5];
+        uint32_t frag_off = ((uint32_t)hs[6] << 16) | ((uint32_t)hs[7] << 8) | hs[8];
+        uint32_t frag_len = ((uint32_t)hs[9] << 16) | ((uint32_t)hs[10] << 8) | hs[11];
+
+        if (!seen) {
+          hello_seq = seq;
+          hello_total = hs_len;
+          seen = 1;
+        }
+
+        if (seq == hello_seq) {
+          uint32_t end = frag_off + frag_len;
+          if (end > hello_end) {
+            hello_end = end;
+          }
+        }
+      }
+    }
+
+    off += 13 + rec_len;
+  }
+
+  if (!seen) {
+    return len > 0;
+  }
+
+  return hello_end >= hello_total;
+}
+
+static int peer_connection_dtls_has_client_hello(const uint8_t* buf, size_t len) {
+  size_t off = 0;
+
+  while (off + 13 <= len) {
+    uint8_t ctype = buf[off];
+    uint16_t rec_len = ((uint16_t)buf[off + 11] << 8) | buf[off + 12];
+
+    if (off + 13 + rec_len > len) {
+      break;
+    }
+
+    if (ctype == 22 && rec_len >= 1 && buf[off + 13] == 1) {
+      return 1;
+    }
+
+    off += 13 + rec_len;
+  }
+
+  return 0;
+}
+
+static int peer_connection_dtls_should_buffer_more(const uint8_t* buf, size_t len) {
+  if (!peer_connection_dtls_has_client_hello(buf, len)) {
+    return 0;
+  }
+
+  return !peer_connection_dtls_client_hello_complete(buf, len);
+}
+
+static void peer_connection_dtls_drain_flight(PeerConnection* pc) {
+  uint8_t tmp[CONFIG_MTU];
+  int idle = 0;
+
+  while (idle < PEER_CONNECTION_DTLS_FLIGHT_MAX_IDLE) {
+    if (pc->dtls_rx_len > 0 &&
+        peer_connection_dtls_client_hello_complete(pc->dtls_rx_buf, pc->dtls_rx_len)) {
+      break;
+    }
+
+    int ret = agent_recv_from_selected(&pc->agent, tmp, sizeof(tmp));
+    if (ret <= 0) {
+      idle++;
+      continue;
+    }
+
+    if (!peer_connection_datagram_is_dtls(tmp, (size_t)ret)) {
+      continue;
+    }
+
+    if (pc->dtls_rx_len + (size_t)ret > PEER_CONNECTION_DTLS_RX_SIZE) {
+      LOGE("DTLS RX buffer overflow (flight %zu + %d)", pc->dtls_rx_len, ret);
+      break;
+    }
+
+    memcpy(pc->dtls_rx_buf + pc->dtls_rx_len, tmp, ret);
+    pc->dtls_rx_len += (size_t)ret;
+    LOGD("DTLS RX: flight append len=%d buffered=%zu", ret, pc->dtls_rx_len);
+    idle = 0;
+  }
+}
+
+static int peer_connection_dtls_handshake_retriable(int hs_ret) {
+  if (hs_ret == MBEDTLS_ERR_SSL_WANT_READ || hs_ret == MBEDTLS_ERR_SSL_WANT_WRITE) {
+    return 1;
+  }
+
+  if (hs_ret == MBEDTLS_ERR_SSL_INVALID_RECORD ||
+      hs_ret == MBEDTLS_ERR_SSL_BAD_HS_PROTOCOL_VERSION) {
+    return 1;
+  }
+
+  return 0;
+}
+
 static int peer_connection_dtls_srtp_recv(void* ctx, unsigned char* buf, size_t len) {
-  int recv_max = 0;
   int ret = -1;
+  uint8_t tmp[CONFIG_MTU];
   DtlsSrtp* dtls_srtp = (DtlsSrtp*)ctx;
   PeerConnection* pc = (PeerConnection*)dtls_srtp->user_data;
 
-  if (pc->agent_ret > 0 && pc->agent_ret <= len) {
+  if (pc->agent_ret > 0 && pc->agent_ret <= (int)len) {
     memcpy(buf, pc->agent_buf, pc->agent_ret);
     ret = pc->agent_ret;
     pc->agent_ret = 0;
     return ret;
   }
 
-  while (recv_max < DTLS_UDP_RECV_MAX_TRIES && pc->state == PEER_CONNECTION_CONNECTED) {
-    ret = agent_recv(&pc->agent, (uint8_t*)buf, len);
-
-    if (ret == 0) {
-      /* STUN handled; keep polling without counting toward idle timeout. */
-      continue;
-    }
-
-    if (ret > 0) {
-      if (peer_connection_datagram_is_dtls((const uint8_t*)buf, ret)) {
-        LOGD("DTLS RX: len=%d content_type=%u", ret, buf[0]);
-        return ret;
+  if (pc->state == PEER_CONNECTION_CONNECTED) {
+    if (pc->dtls_srtp.role == DTLS_SRTP_ROLE_SERVER) {
+      if (pc->dtls_rx_len == 0) {
+        peer_connection_dtls_drain_flight(pc);
       }
-      continue;
+      while (pc->dtls_rx_len > 0 &&
+             peer_connection_dtls_should_buffer_more(pc->dtls_rx_buf, pc->dtls_rx_len)) {
+        peer_connection_dtls_drain_flight(pc);
+      }
+    } else if (pc->dtls_rx_len == 0) {
+      ret = agent_recv_from_selected(&pc->agent, tmp, sizeof(tmp));
+      if (ret > 0 && peer_connection_datagram_is_dtls(tmp, (size_t)ret)) {
+        if ((size_t)ret <= len) {
+          memcpy(buf, tmp, ret);
+          LOGD("DTLS RX: len=%d content_type=%u", ret, tmp[0]);
+          return ret;
+        }
+        if ((size_t)ret <= PEER_CONNECTION_DTLS_RX_SIZE) {
+          memcpy(pc->dtls_rx_buf, tmp, ret);
+          pc->dtls_rx_len = (size_t)ret;
+        }
+      }
+    }
+  }
+
+  if (pc->dtls_rx_len > 0) {
+    if (pc->dtls_srtp.role == DTLS_SRTP_ROLE_SERVER &&
+        peer_connection_dtls_should_buffer_more(pc->dtls_rx_buf, pc->dtls_rx_len)) {
+      return MBEDTLS_ERR_SSL_WANT_READ;
     }
 
-    recv_max++;
+    size_t n = pc->dtls_rx_len;
+    if (n > len) {
+      n = len;
+    }
+    memcpy(buf, pc->dtls_rx_buf, n);
+    pc->dtls_rx_len -= n;
+    if (pc->dtls_rx_len > 0) {
+      memmove(pc->dtls_rx_buf, pc->dtls_rx_buf + n, pc->dtls_rx_len);
+    }
+    LOGD("DTLS RX: deliver len=%zu content_type=%u remain=%zu", n, buf[0], pc->dtls_rx_len);
+    return (int)n;
   }
-  return ret == 0 ? MBEDTLS_ERR_SSL_WANT_READ : ret;
+
+  return MBEDTLS_ERR_SSL_WANT_READ;
 }
 
 static int peer_connection_dtls_srtp_send(void* ctx, const uint8_t* buf, size_t len) {
@@ -571,7 +738,7 @@ static DtlsSrtpRole peer_connection_answer_dtls_role(PeerConnection* pc) {
 
 static const char* peer_connection_dtls_role_setup_value(SdpType sdp_type, DtlsSrtpRole d) {
   if (sdp_type == SDP_TYPE_OFFER) {
-    return "a=setup:actpass";
+    return d == DTLS_SRTP_ROLE_CLIENT ? "a=setup:active" : "a=setup:actpass";
   }
   return d == DTLS_SRTP_ROLE_SERVER ? "a=setup:passive" : "a=setup:active";
 }
@@ -617,18 +784,20 @@ int peer_connection_loop(PeerConnection* pc) {
       /* Drain a few pending STUN packets; do not loop forever on keepalives. */
       agent_drain_pending(&pc->agent);
 
-      for (int burst = 0; burst < 16; burst++) {
-        hs_ret = dtls_srtp_handshake_step(&pc->dtls_srtp, remote_addr);
-        if (hs_ret == 0) {
+      {
+        uint32_t now = ports_get_epoch_time();
+        if (pc->dtls_hs_want_count > 0 && pc->last_dtls_hs_ms != 0 &&
+            (now - pc->last_dtls_hs_ms) < 50) {
           break;
         }
-        if (hs_ret != MBEDTLS_ERR_SSL_WANT_READ && hs_ret != MBEDTLS_ERR_SSL_WANT_WRITE) {
-          break;
-        }
+        pc->last_dtls_hs_ms = now;
       }
+
+      hs_ret = dtls_srtp_handshake_step(&pc->dtls_srtp, remote_addr);
 
       if (hs_ret == 0) {
         pc->dtls_hs_want_count = 0;
+        peer_connection_dtls_rx_clear(pc);
         LOGI("DTLS-SRTP handshake done");
 
         if (pc->config.datachannel) {
@@ -638,22 +807,28 @@ int peer_connection_loop(PeerConnection* pc) {
         }
 
         STATE_CHANGED(pc, PEER_CONNECTION_COMPLETED);
-      } else if (hs_ret == MBEDTLS_ERR_SSL_WANT_READ || hs_ret == MBEDTLS_ERR_SSL_WANT_WRITE) {
+      } else if (peer_connection_dtls_handshake_retriable(hs_ret)) {
         pc->dtls_hs_want_count++;
         if (pc->dtls_hs_want_count == 1) {
           LOGI("DTLS handshake in progress (role=%s)",
                pc->dtls_srtp.role == DTLS_SRTP_ROLE_SERVER ? "server/passive" : "client/active");
+        } else if (hs_ret != MBEDTLS_ERR_SSL_WANT_READ && hs_ret != MBEDTLS_ERR_SSL_WANT_WRITE &&
+                   pc->dtls_hs_want_count <= 5) {
+          LOGW("DTLS handshake waiting for more records (ret=-0x%.4x, count=%d)",
+               (unsigned int)-hs_ret, pc->dtls_hs_want_count);
         } else if (pc->dtls_hs_want_count % 200 == 0) {
           LOGW("DTLS handshake still waiting (want=%d, count=%d)",
                hs_ret, pc->dtls_hs_want_count);
         }
         if (pc->dtls_hs_want_count > 500) {
           LOGE("DTLS handshake timeout after ICE connected");
+          peer_connection_dtls_rx_clear(pc);
           dtls_srtp_reset_session(&pc->dtls_srtp);
           STATE_CHANGED(pc, PEER_CONNECTION_FAILED);
         }
       } else {
         pc->dtls_hs_want_count = 0;
+        peer_connection_dtls_rx_clear(pc);
         dtls_srtp_reset_session(&pc->dtls_srtp);
         STATE_CHANGED(pc, PEER_CONNECTION_FAILED);
       }
@@ -865,7 +1040,12 @@ void peer_connection_set_remote_description(PeerConnection* pc, const char* sdp,
 
   // Reconfigure DTLS role based on remote's setup value
   if (has_setup && type == SDP_TYPE_ANSWER) {
+    if (pc->talk_dtls_client_offer) {
+      role = DTLS_SRTP_ROLE_CLIENT;
+      LOGI("Talk caller: keep DTLS client (offer was setup:active)");
+    }
     dtls_srtp_reconfig(&pc->dtls_srtp, role);
+    peer_connection_dtls_rx_clear(pc);
   }
 
   pc->dtls_handshake_started = 0;
@@ -885,15 +1065,28 @@ static const char* peer_connection_create_sdp(PeerConnection* pc, SdpType sdp_ty
 
   pc->sctp.connected = 0;
   pc->dtls_hs_want_count = 0;
+  peer_connection_dtls_rx_clear(pc);
 
   switch (sdp_type) {
     case SDP_TYPE_OFFER:
-      role = DTLS_SRTP_ROLE_SERVER;
+      if (pc->config.sdp_profile == SDP_PROFILE_ZLM_TALK) {
+        /* Talk caller: initiate DTLS (same as callee answer path). Avoids parsing
+         * browser's fragmented ClientHello when we would otherwise be DTLS server. */
+        role = DTLS_SRTP_ROLE_CLIENT;
+        pc->talk_dtls_client_offer = 1;
+      } else {
+        role = DTLS_SRTP_ROLE_SERVER;
+        pc->talk_dtls_client_offer = 0;
+      }
       agent_clear_candidates(&pc->agent);
       pc->agent.mode = AGENT_MODE_CONTROLLING;
       pc->remote_dtls_setup = REMOTE_DTLS_SETUP_UNKNOWN;
+      if (pc->config.sdp_profile == SDP_PROFILE_ZLM_TALK) {
+        LOGI("Talk offer DTLS role: active/client (setup:active)");
+      }
       break;
     case SDP_TYPE_ANSWER:
+      pc->talk_dtls_client_offer = 0;
       role = peer_connection_answer_dtls_role(pc);
       pc->agent.mode = AGENT_MODE_CONTROLLED;
       LOGI("Answer DTLS role: %s (remote offer setup: %s)",

@@ -78,7 +78,7 @@ typedef struct PeerConfiguration {
   MediaCodec video_codec;
   DataChannelType datachannel;
 
-  /** SDP_PROFILE_P2P (default), SDP_PROFILE_WHIP (push), SDP_PROFILE_WHEP (pull). */
+  /** SDP_PROFILE_P2P (default), WHIP (push), WHEP (pull), ZLM_TALK (bidirectional). */
   SdpProfile sdp_profile;
 
   /**

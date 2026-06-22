@@ -5,7 +5,8 @@
 #include "sdp.h"
 
 static int sdp_profile_is_zlm_streaming(SdpProfile profile) {
-  return profile == SDP_PROFILE_WHIP || profile == SDP_PROFILE_WHEP;
+  return profile == SDP_PROFILE_WHIP || profile == SDP_PROFILE_WHEP ||
+         profile == SDP_PROFILE_ZLM_TALK;
 }
 
 static void sdp_append_media_direction(char* sdp, SdpProfile profile) {
@@ -13,6 +14,8 @@ static void sdp_append_media_direction(char* sdp, SdpProfile profile) {
     sdp_append(sdp, "a=sendonly");
   } else if (profile == SDP_PROFILE_WHEP) {
     sdp_append(sdp, "a=recvonly");
+  } else if (profile == SDP_PROFILE_ZLM_TALK) {
+    sdp_append(sdp, "a=sendrecv");
   } else {
     sdp_append(sdp, "a=sendrecv");
   }

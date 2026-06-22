@@ -84,6 +84,9 @@ int agent_recv(Agent* agent, uint8_t* buf, int len);
 
 int agent_recv_datagram(Agent* agent, uint8_t* buf, int len);
 
+/* STUN handled inline; media (DTLS/RTP) only from selected/nominated remote. */
+int agent_recv_from_selected(Agent* agent, uint8_t* buf, int len);
+
 void agent_drain_pending(Agent* agent);
 
 void agent_set_remote_description(Agent* agent, char* description);

@@ -46,13 +46,21 @@
 
 #define ZLM_TYPE_PLAY "play"
 #define ZLM_TYPE_PUSH "push"
+#define ZLM_TYPE_TALK "talk"
+
+typedef enum {
+  ZLM_MODE_PLAY = 0,
+  ZLM_MODE_PUSH = 1,
+  ZLM_MODE_TALK = 2,
+} ZlmMode;
 
 #define MAX_ICE_SERVERS 5
 #define AUDIO_FRAME_BYTES 160
 #define AUDIO_SEND_LOG_INTERVAL 100
 
 static int g_interrupted = 0;
-static int g_is_push = 0;
+static ZlmMode g_mode = ZLM_MODE_PLAY;
+static int g_wait_incoming = 0;
 static int g_registered = 0;
 static int g_call_done = 0;
 static int g_signal_thread_started = 0;
@@ -79,6 +87,63 @@ static int g_ice_server_count = 0;
 
 static char g_audio_file[512] = {0};
 static int g_audio_file_explicit = 0;
+static char g_audio_out_file[512] = {0};
+
+static const char* zlm_signaling_type(void) {
+  switch (g_mode) {
+    case ZLM_MODE_PUSH:
+      return ZLM_TYPE_PUSH;
+    case ZLM_MODE_TALK:
+      return ZLM_TYPE_TALK;
+    default:
+      return ZLM_TYPE_PLAY;
+  }
+}
+
+/** play 或 talk+peer_room：本端主动 call（--wait 时仅注册不保活呼叫）。 */
+static int zlm_mode_is_caller(void) {
+  if (g_wait_incoming) {
+    return 0;
+  }
+  return g_mode == ZLM_MODE_PLAY ||
+         (g_mode == ZLM_MODE_TALK && g_peer_room_id[0] != '\0');
+}
+
+static int zlm_mode_sends_audio(void) {
+  return g_mode == ZLM_MODE_PUSH || g_mode == ZLM_MODE_TALK;
+}
+
+static const char* zlm_mode_label(void) {
+  if (g_wait_incoming) {
+    switch (g_mode) {
+      case ZLM_MODE_PUSH:
+        return "push (仅注册保活)";
+      case ZLM_MODE_TALK:
+        return "talk (仅注册保活)";
+      default:
+        return "play (仅注册保活)";
+    }
+  }
+  switch (g_mode) {
+    case ZLM_MODE_PUSH:
+      return "push";
+    case ZLM_MODE_TALK:
+      return g_peer_room_id[0] ? "talk (主动呼叫)" : "talk (被动接听)";
+    default:
+      return "play";
+  }
+}
+
+static const char* zlm_sdp_label(void) {
+  switch (g_mode) {
+    case ZLM_MODE_PUSH:
+      return "WHIP (sendonly, mid:0)";
+    case ZLM_MODE_TALK:
+      return "ZLM talk (sendrecv, mid:0)";
+    default:
+      return "WHEP (recvonly, mid:0)";
+  }
+}
 
 static void signal_handler(int sig) {
   (void)sig;
@@ -146,7 +211,7 @@ static char* build_call_request(const char* sdp) {
   cJSON_AddStringToObject(root, ZLM_VHOST_KEY, "__defaultVhost__");
   cJSON_AddStringToObject(root, ZLM_APP_KEY, g_app);
   cJSON_AddStringToObject(root, ZLM_STREAM_KEY, g_stream);
-  cJSON_AddStringToObject(root, ZLM_TYPE_KEY, g_is_push ? ZLM_TYPE_PUSH : ZLM_TYPE_PLAY);
+  cJSON_AddStringToObject(root, ZLM_TYPE_KEY, zlm_signaling_type());
   cJSON_AddStringToObject(root, ZLM_SDP_KEY, sdp);
   return json_print_and_delete(root);
 }
@@ -163,7 +228,7 @@ static char* build_accept_response(const char* sdp) {
   cJSON_AddStringToObject(root, ZLM_VHOST_KEY, "__defaultVhost__");
   cJSON_AddStringToObject(root, ZLM_APP_KEY, g_app);
   cJSON_AddStringToObject(root, ZLM_STREAM_KEY, g_stream);
-  cJSON_AddStringToObject(root, ZLM_TYPE_KEY, g_is_push ? ZLM_TYPE_PUSH : ZLM_TYPE_PLAY);
+  cJSON_AddStringToObject(root, ZLM_TYPE_KEY, zlm_signaling_type());
   cJSON_AddStringToObject(root, ZLM_SDP_KEY, sdp);
   return json_print_and_delete(root);
 }
@@ -444,8 +509,12 @@ static void on_connection_state(PeerConnectionState state, void* data) {
   (void)data;
   printf("[P2P] 连接状态: %s\n", peer_connection_state_to_string(state));
   g_state = state;
-  if (state == PEER_CONNECTION_COMPLETED && g_is_push) {
-    printf("[P2P] DTLS 完成，开始推送 PCMA 音频 (每 %d 帧打印一次)\n", AUDIO_SEND_LOG_INTERVAL);
+  if (state == PEER_CONNECTION_COMPLETED && zlm_mode_sends_audio()) {
+    if (g_mode == ZLM_MODE_TALK) {
+      printf("[P2P] DTLS 完成，对讲已建立 (双向 PCMA，每 %d 帧打印一次发送统计)\n", AUDIO_SEND_LOG_INTERVAL);
+    } else {
+      printf("[P2P] DTLS 完成，开始推送 PCMA 音频 (每 %d 帧打印一次)\n", AUDIO_SEND_LOG_INTERVAL);
+    }
   }
 }
 
@@ -457,9 +526,15 @@ static void on_ice_candidate(char* sdp, void* userdata) {
 
 static void on_audio_track(uint8_t* data, size_t size, void* userdata) {
   static uint32_t packets = 0;
-  (void)data;
-  (void)userdata;
+  FILE* fp_out = (FILE*)userdata;
+
   packets++;
+  if (fp_out) {
+    fwrite(data, 1, size, fp_out);
+  }
+  if (packets == 1) {
+    printf("[P2P] 收到首包音频: size=%zu\n", size);
+  }
   if (packets % 50 == 0) {
     printf("[P2P] 收到音频包: size=%zu packets=%u\n", size, packets);
   }
@@ -511,6 +586,20 @@ static int handle_call_accept(cJSON* root) {
   return 0;
 }
 
+static int handle_call_reject(cJSON* root) {
+  const char* reason = json_string(root, "reason");
+  const char* room = json_string(root, ZLM_ROOM_ID);
+
+  printf("[信令] 呼叫被拒绝: reason=%s room_id=%s\n",
+         reason ? reason : "(unknown)",
+         room ? room : "(unknown)");
+  printf("[P2P] 提示: call 的 room_id 必须是对方已 register 的「我的房间 ID」，不是 app/stream 名。\n");
+  printf("[P2P] 提示: 请先让对方在浏览器对讲模式点「开始」完成注册，再用对方的 My Room 作为 --peer-room。\n");
+  printf("[P2P] 提示: 或改用被动对讲 (--talk 不设 --peer-room)，由浏览器呼叫本端 --my-room。\n");
+  g_interrupted = 1;
+  return 0;
+}
+
 static int handle_candidate(cJSON* root) {
   const char* candidate = json_string(root, ZLM_CANDIDATE_KEY);
   if (!candidate) {
@@ -542,6 +631,8 @@ static void handle_signaling_message(const char* msg) {
     handle_call_request(root);
   } else if (strcmp(cls, ZLM_CLASS_ACCEPT) == 0 && strcmp(method, ZLM_METHOD_CALL) == 0) {
     handle_call_accept(root);
+  } else if (strcmp(cls, ZLM_CLASS_REJECT) == 0 && strcmp(method, ZLM_METHOD_CALL) == 0) {
+    handle_call_reject(root);
   } else if (strcmp(cls, ZLM_CLASS_REJECT) == 0) {
     printf("[信令] rejected: %s/%s\n", cls, method);
   } else if (strcmp(cls, ZLM_CLASS_INDICATION) == 0 && strcmp(method, ZLM_METHOD_CANDIDATE) == 0) {
@@ -588,19 +679,25 @@ static void* peer_connection_task(void* data) {
 }
 
 static void print_usage(const char* prog) {
-  printf("用法: %s -u <ws://host:port/path|wss://host:port/path> --my-room <id> [--peer-room <id>] [--push|--play]\n", prog);
+  printf("用法: %s -u <ws://host:port/path|wss://host:port/path> --my-room <id> [--peer-room <id>] [--push|--play|--talk]\n", prog);
   printf("\n参数:\n");
   printf("  -u <url>          ZLM P2P WebSocket URL\n");
   printf("  -H <host>         兼容旧参数: 信令服务器地址，未指定 -u 时组成 ws://host:port/\n");
   printf("  -p <port>         兼容旧参数: 信令服务器端口 (默认 3000)\n");
   printf("  -a <app>          应用名 (默认 live)\n");
   printf("  -s <stream>       流名 (默认 p2p-stream)\n");
-  printf("  -A <file>         推流音频: 原始 G.711 A-law (PCMA 8kHz mono, 20ms=160字节)\n");
-  printf("  --audio-file <f>  同 -A；push 未指定时自动尝试 ch_eagles.alaw\n");
+  printf("  -A <file>         上行音频: 原始 G.711 A-law (PCMA 8kHz mono, 20ms=160字节)\n");
+  printf("  --audio-file <f>  同 -A；push/talk 未指定时自动尝试 ch_eagles.alaw\n");
+  printf("  -o <file>         talk/play: 将收到的 PCMA 写入 A-law 文件 (可选)\n");
   printf("  --my-room <id>    本端 room_id\n");
-  printf("  --peer-room <id>  对端 room_id，play 模式必填，push 可从 call 中学习\n");
-  printf("  --push            推流端模式: 等待 call 并发送 PCMA 音频\n");
-  printf("  --play            拉流端模式: 主动 request/call\n");
+  printf("  --peer-room <id>  对方已 register 的房间 ID (浏览器 My Room)；非 app/stream\n");
+  printf("                    play/talk 主动呼叫必填；push/talk 被动可从来电学习\n");
+  printf("  --push            推流: sendonly，等待 call\n");
+  printf("  --play            拉流: recvonly，主动 call\n");
+  printf("  --talk            对讲: sendrecv；无 peer-room 则被动接听，有则主动呼叫\n");
+  printf("  --wait            仅 register 保活，不发起 call，等待对方呼叫本端 --my-room\n");
+  printf("  --register-only   同 --wait\n");
+  printf("  --wait-incoming   同 --wait\n");
 }
 
 static int parse_args(int argc, char* argv[]) {
@@ -618,14 +715,21 @@ static int parse_args(int argc, char* argv[]) {
     } else if ((strcmp(argv[i], "-A") == 0 || strcmp(argv[i], "--audio-file") == 0) && i + 1 < argc) {
       strncpy(g_audio_file, argv[++i], sizeof(g_audio_file) - 1);
       g_audio_file_explicit = 1;
+    } else if (strcmp(argv[i], "-o") == 0 && i + 1 < argc) {
+      strncpy(g_audio_out_file, argv[++i], sizeof(g_audio_out_file) - 1);
     } else if (strcmp(argv[i], "--my-room") == 0 && i + 1 < argc) {
       strncpy(g_my_room_id, argv[++i], sizeof(g_my_room_id) - 1);
     } else if (strcmp(argv[i], "--peer-room") == 0 && i + 1 < argc) {
       strncpy(g_peer_room_id, argv[++i], sizeof(g_peer_room_id) - 1);
     } else if (strcmp(argv[i], "--push") == 0) {
-      g_is_push = 1;
+      g_mode = ZLM_MODE_PUSH;
     } else if (strcmp(argv[i], "--play") == 0) {
-      g_is_push = 0;
+      g_mode = ZLM_MODE_PLAY;
+    } else if (strcmp(argv[i], "--talk") == 0) {
+      g_mode = ZLM_MODE_TALK;
+    } else if (strcmp(argv[i], "--wait") == 0 || strcmp(argv[i], "--register-only") == 0 ||
+               strcmp(argv[i], "--wait-incoming") == 0) {
+      g_wait_incoming = 1;
     } else {
       return -1;
     }
@@ -635,12 +739,17 @@ static int parse_args(int argc, char* argv[]) {
     snprintf(g_ws_url, sizeof(g_ws_url), "ws://%s:%d/", g_signaling_host, g_signaling_port);
   }
 
-  if (!g_ws_url[0] || !g_my_room_id[0] || (!g_is_push && !g_peer_room_id[0])) {
+  if (!g_ws_url[0] || !g_my_room_id[0]) {
+    return -1;
+  }
+  if (g_mode == ZLM_MODE_PLAY && !g_peer_room_id[0] && !g_wait_incoming) {
     return -1;
   }
 
   return 0;
 }
+
+static FILE* g_fp_audio_out = NULL;
 
 static void fill_peer_config(PeerConfiguration* config) {
   memset(config, 0, sizeof(*config));
@@ -659,10 +768,16 @@ static void fill_peer_config(PeerConfiguration* config) {
   config->datachannel = DATA_CHANNEL_NONE;
   config->video_codec = CODEC_NONE;
   config->audio_codec = CODEC_PCMA;
-  /* Browser/ZLM P2P uses numeric mids (0/1) and trickle ICE like WHIP/WHEP,
-   * not libpeer P2P mids (audio/video). */
-  config->sdp_profile = g_is_push ? SDP_PROFILE_WHIP : SDP_PROFILE_WHEP;
+  /* Browser/ZLM P2P uses numeric mids (0/1) and trickle ICE like WHIP/WHEP. */
+  if (g_mode == ZLM_MODE_PUSH) {
+    config->sdp_profile = SDP_PROFILE_WHIP;
+  } else if (g_mode == ZLM_MODE_TALK) {
+    config->sdp_profile = SDP_PROFILE_ZLM_TALK;
+  } else {
+    config->sdp_profile = SDP_PROFILE_WHEP;
+  }
   config->onaudiotrack = on_audio_track;
+  config->user_data = g_fp_audio_out;
 }
 
 int main(int argc, char* argv[]) {
@@ -679,7 +794,7 @@ int main(int argc, char* argv[]) {
     return 1;
   }
 
-  if (g_is_push) {
+  if (zlm_mode_sends_audio()) {
     if (g_audio_file_explicit) {
       fp_audio = fopen(g_audio_file, "rb");
       if (!fp_audio) {
@@ -695,6 +810,18 @@ int main(int argc, char* argv[]) {
     }
   }
 
+  if (g_audio_out_file[0]) {
+    g_fp_audio_out = fopen(g_audio_out_file, "wb");
+    if (!g_fp_audio_out) {
+      printf("[错误] 无法打开音频输出文件: %s\n", g_audio_out_file);
+      if (fp_audio) {
+        fclose(fp_audio);
+      }
+      return 1;
+    }
+    printf(" 下行录音: %s\n", g_audio_out_file);
+  }
+
   signal(SIGINT, signal_handler);
   srand((unsigned int)time(NULL));
   generate_id(g_guest_id, sizeof(g_guest_id), "guest-");
@@ -707,10 +834,13 @@ int main(int argc, char* argv[]) {
   printf(" My room: %s\n", g_my_room_id);
   printf(" Peer room: %s\n", g_peer_room_id[0] ? g_peer_room_id : "(from incoming call)");
   printf(" Guest: %s\n", g_guest_id);
-  printf(" Mode: %s\n", g_is_push ? "push" : "play");
-  printf(" SDP: %s\n", g_is_push ? "WHIP (sendonly, mid:0)" : "WHEP (recvonly, mid:0)");
-  if (g_is_push) {
-    printf(" Audio: PCMA/8000 — %s\n", audio_source_label);
+  printf(" Mode: %s\n", zlm_mode_label());
+  printf(" SDP: %s\n", zlm_sdp_label());
+  if (zlm_mode_sends_audio()) {
+    printf(" Audio uplink: PCMA/8000 — %s\n", audio_source_label);
+  }
+  if (g_mode == ZLM_MODE_TALK && !g_peer_room_id[0]) {
+    printf(" Talk: 被动接听，等待浏览器 talk 模式呼叫本房间\n");
   }
   printf("========================================\n\n");
 
@@ -727,6 +857,13 @@ int main(int argc, char* argv[]) {
     core_websocket_close(&g_ws);
     peer_deinit();
     return 1;
+  }
+
+  if (g_wait_incoming) {
+    printf("[P2P] 已 register: room=%s，WebSocket 保活，未发起 call\n", g_my_room_id);
+    if (g_peer_room_id[0]) {
+      printf("[P2P] 已填 peer-room=%s 但在 --wait 下不会主动呼叫；对方请 call 本端 room\n", g_peer_room_id);
+    }
   }
 
   PeerConfiguration config;
@@ -746,15 +883,31 @@ int main(int argc, char* argv[]) {
   pthread_create(&signal_thread, NULL, signaling_task, NULL);
   g_signal_thread_started = 1;
 
-  if (!g_is_push && send_call_offer() < 0) {
-    printf("[错误] 发送 call offer 失败\n");
-    g_interrupted = 1;
+  if (zlm_mode_is_caller()) {
+    printf("[P2P] 主动呼叫 peer_room=%s (须对方已 WebSocket register)\n", g_peer_room_id);
+    if (send_call_offer() < 0) {
+      printf("[错误] 发送 call offer 失败\n");
+      g_interrupted = 1;
+    }
+  } else if (g_mode == ZLM_MODE_PUSH || g_mode == ZLM_MODE_TALK || g_wait_incoming) {
+    printf("[P2P] 等待对方呼叫... (Peer Room / 被叫 room=%s)\n", g_my_room_id);
   }
 
   while (!g_interrupted) {
     PeerConnectionState state = peer_connection_get_state(g_pc);
 
-    if (state == PEER_CONNECTION_COMPLETED && g_is_push) {
+    if (g_wait_incoming && state != PEER_CONNECTION_COMPLETED) {
+      static uint64_t last_keepalive_log = 0;
+      struct timeval tv;
+      gettimeofday(&tv, NULL);
+      uint64_t now = (uint64_t)tv.tv_sec * 1000 + tv.tv_usec / 1000;
+      if (last_keepalive_log == 0 || now - last_keepalive_log >= 30000) {
+        printf("[P2P] 保活中: room=%s，等待来电 (未 completed)\n", g_my_room_id);
+        last_keepalive_log = now;
+      }
+    }
+
+    if (state == PEER_CONNECTION_COMPLETED && zlm_mode_sends_audio()) {
       struct timeval tv;
       gettimeofday(&tv, NULL);
       uint64_t now = (uint64_t)tv.tv_sec * 1000 + tv.tv_usec / 1000;
@@ -787,7 +940,7 @@ int main(int argc, char* argv[]) {
           }
         }
       }
-    } else if (g_is_push && state != PEER_CONNECTION_COMPLETED && audio_packets_sent == 0) {
+    } else if (zlm_mode_sends_audio() && state != PEER_CONNECTION_COMPLETED && audio_packets_sent == 0) {
       static uint64_t last_wait_log = 0;
       struct timeval tv;
       gettimeofday(&tv, NULL);
@@ -805,6 +958,10 @@ int main(int argc, char* argv[]) {
 
   if (fp_audio) {
     fclose(fp_audio);
+  }
+  if (g_fp_audio_out) {
+    fclose(g_fp_audio_out);
+    g_fp_audio_out = NULL;
   }
 
   if (g_peer_room_id[0]) {

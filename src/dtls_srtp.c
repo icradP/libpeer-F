@@ -16,6 +16,14 @@
 #include "socket.h"
 #include "utils.h"
 
+#ifndef MBEDTLS_ERR_SSL_BAD_HS_PROTOCOL_VERSION
+#define MBEDTLS_ERR_SSL_BAD_HS_PROTOCOL_VERSION -0x7300
+#endif
+
+#ifndef MBEDTLS_ERR_SSL_INVALID_RECORD
+#define MBEDTLS_ERR_SSL_INVALID_RECORD -0x7200
+#endif
+
 int dtls_srtp_udp_send(void* ctx, const uint8_t* buf, size_t len) {
   DtlsSrtp* dtls_srtp = (DtlsSrtp*)ctx;
   UdpSocket* udp_socket = (UdpSocket*)dtls_srtp->user_data;
@@ -474,6 +482,18 @@ int dtls_srtp_handshake_step(DtlsSrtp* dtls_srtp, Address* addr) {
   ret = dtls_srtp_do_handshake(dtls_srtp);
 
   if (ret == MBEDTLS_ERR_SSL_HELLO_VERIFY_REQUIRED && dtls_srtp->role == DTLS_SRTP_ROLE_SERVER) {
+    dtls_srtp->state = DTLS_SRTP_STATE_INIT;
+    return MBEDTLS_ERR_SSL_WANT_READ;
+  }
+
+  if (ret == MBEDTLS_ERR_SSL_BAD_HS_PROTOCOL_VERSION && dtls_srtp->role == DTLS_SRTP_ROLE_SERVER) {
+    LOGW("DTLS server: incomplete handshake flight, retry after more input");
+    dtls_srtp->state = DTLS_SRTP_STATE_INIT;
+    return MBEDTLS_ERR_SSL_WANT_READ;
+  }
+
+  if (ret == MBEDTLS_ERR_SSL_INVALID_RECORD && dtls_srtp->role == DTLS_SRTP_ROLE_SERVER) {
+    LOGW("DTLS server: invalid record during handshake, retry after more input");
     dtls_srtp->state = DTLS_SRTP_STATE_INIT;
     return MBEDTLS_ERR_SSL_WANT_READ;
   }

@@ -15,6 +15,8 @@ typedef enum SdpProfile {
   SDP_PROFILE_P2P = 0,
   SDP_PROFILE_WHIP,
   SDP_PROFILE_WHEP,
+  /** ZLM P2P talk: WHIP/WHEP bundle (mid:0) with sendrecv. */
+  SDP_PROFILE_ZLM_TALK,
 } SdpProfile;
 
 void sdp_append_h264(char* sdp, SdpProfile profile, uint32_t ssrc);

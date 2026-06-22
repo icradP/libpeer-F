@@ -386,6 +386,57 @@ int agent_recv_datagram(Agent* agent, uint8_t* buf, int len) {
   return agent_socket_recv(agent, &addr, buf, len);
 }
 
+int agent_recv_from_selected(Agent* agent, uint8_t* buf, int len) {
+  Address addr;
+  Address* expect = NULL;
+  int ret;
+  int tries = 0;
+
+  if (agent->selected_pair != NULL && agent->selected_pair->remote != NULL) {
+    expect = &agent->selected_pair->remote->addr;
+  } else if (agent->nominated_pair != NULL && agent->nominated_pair->remote != NULL) {
+    expect = &agent->nominated_pair->remote->addr;
+  }
+
+  while (tries < DTLS_UDP_RECV_MAX_TRIES) {
+    ret = agent_socket_recv(agent, &addr, buf, len);
+    if (ret <= 0) {
+      return ret;
+    }
+
+    if (stun_probe(buf, ret) == 0) {
+      StunMessage stun_msg;
+      memcpy(stun_msg.buf, buf, ret);
+      stun_msg.size = ret;
+      stun_parse_msg_buf(&stun_msg);
+      switch (stun_msg.stunclass) {
+        case STUN_CLASS_REQUEST:
+          agent_process_stun_request(agent, &stun_msg, &addr);
+          break;
+        case STUN_CLASS_RESPONSE:
+          agent_process_stun_response(agent, &stun_msg);
+          break;
+        case STUN_CLASS_ERROR:
+          break;
+        default:
+          break;
+      }
+      tries++;
+      continue;
+    }
+
+    if (expect != NULL && !addr_equal(&addr, expect)) {
+      LOGD("drop datagram from non-selected peer (expect port %u)", expect->port);
+      tries++;
+      continue;
+    }
+
+    return ret;
+  }
+
+  return -1;
+}
+
 void agent_drain_pending(Agent* agent) {
   uint8_t buf[1400];
 
